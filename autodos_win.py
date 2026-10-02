@@ -1146,13 +1146,23 @@ class App:
         import re as _re
         cycles_str  = str(entry.get("cycles", "3000"))
         memsize     = snap_memsize(int(entry.get("memsize", 16)))
-        limit_match = _re.match(r"max\s+(?:limit\s+)?(\d+)", cycles_str, _re.IGNORECASE)
-        if limit_match:
-            conf_cycles = limit_match.group(1)
+        # ExoDOS cycles come as N, 'max', 'auto', 'max limit N', 'auto limit N'
+        # or 'fixed N'; DOSBox Staging's cpu_cycles only takes N or 'max'
+        cycles_num  = _re.search(r"\d+", cycles_str)
+        if cycles_num:
+            conf_cycles = cycles_num.group(0)
         elif cycles_str.lower() in ("max", "auto"):
             conf_cycles = "max"
         else:
             conf_cycles = cycles_str
+
+        # Memory, EMS and XMS can only be set before DOSBox starts. Passed as
+        # -set so they override dosbox.conf ('set memsize=' in the DOS shell
+        # only sets an environment variable).
+        base_args = ["-conf", str(ASSET_DIR / "dosbox.conf"),
+                     "-set", f"memsize={memsize}",
+                     "-set", f"ems={str(bool(entry.get('ems', True))).lower()}",
+                     "-set", f"xms={str(bool(entry.get('xms', True))).lower()}"]
 
         def make_imgmount(isos):
             quoted = " ".join(f'"{iso}"' if " " in iso else iso for iso in isos)
@@ -1170,11 +1180,10 @@ class App:
             c_path  = str(extracted)
             mount_c = f'mount c "{c_path}"' if " " in c_path else f"mount c {c_path}"
             run_cmd = f'"{cd_exe}"' if " " in cd_exe else cd_exe
-            cmd = [binary] + prefix + ["-conf", str(ASSET_DIR / "dosbox.conf")]
+            cmd = [binary] + prefix + base_args
             cmd += [
                 "-c", f"cpu_cycles {conf_cycles}",
                 "-c", f"cpu_cycles_protected {conf_cycles}",
-                "-c", f"set memsize={memsize}",
                 "-c", mount_c,
                 "-c", make_imgmount(cd_isos),
                 "-c", "D:",
@@ -1195,11 +1204,10 @@ class App:
         mount_c     = f'mount c "{exe_dir_str}"' if " " in exe_dir_str else f"mount c {exe_dir_str}"
         run_cmd     = f'"{exe_name}"' if " " in exe_name else exe_name
 
-        cmd = [binary] + prefix + ["-conf", str(ASSET_DIR / "dosbox.conf")]
+        cmd = [binary] + prefix + base_args
         cmd += [
             "-c", f"cpu_cycles {conf_cycles}",
             "-c", f"cpu_cycles_protected {conf_cycles}",
-            "-c", f"set memsize={memsize}",
             "-c", mount_c,
         ]
         if cd_isos:
