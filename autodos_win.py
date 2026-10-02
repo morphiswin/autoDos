@@ -268,15 +268,16 @@ DOSBOX_WRAPPER_NAMES = {"dosbox", "dosbox-staging", "scummvm", "boxer"}
 # Known good launcher bat names inside game subfolders
 GOOD_BAT_NAMES = {"command.bat", "play.bat", "start.bat", "game.bat", "run.bat", "launch.bat"}
 
-def score_exe(exe: Path, root: Path, stem: str) -> int:
+def score_exe(exe: Path, root: Path, stem: str, depth_offset: int = 0) -> int:
     """Score an EXE/BAT candidate; higher = more likely the main game launcher."""
     name     = exe.name.lower()
     namestem = exe.stem.lower()
     ext      = exe.suffix.lower()
     score    = 0
 
-    # Depth from root (0 = at root, 1 = one subfolder deep, etc.)
-    depth = len(exe.relative_to(root).parts) - 1
+    # Depth from the archive root (0 = at root, 1 = one subfolder deep, etc.)
+    # depth_offset = 1 when root is the archive's single top-level folder
+    depth = len(exe.relative_to(root).parts) - 1 + depth_offset
 
     # ── Penalise root-level .bat named after the game folder ──────────────────
     # These are almost always Windows OS launchers, not DOS game files
@@ -322,7 +323,7 @@ def score_exe(exe: Path, root: Path, stem: str) -> int:
     return score
 
 
-def detect_exe(game_dir: Path, stem: str) -> tuple:
+def detect_exe(game_dir: Path, stem: str, depth_offset: int = 0) -> tuple:
     """Return (all_launchers, best_guess) from extracted game directory.
     Considers both .exe and .bat files; best score wins automatically.
     """
@@ -333,9 +334,10 @@ def detect_exe(game_dir: Path, stem: str) -> tuple:
         return [], None
     if len(all_files) == 1:
         return all_files, all_files[0]
-    scored = sorted(all_files, key=lambda e: score_exe(e, game_dir, stem), reverse=True)
+    score  = lambda e: score_exe(e, game_dir, stem, depth_offset)
+    scored = sorted(all_files, key=score, reverse=True)
     top, second = scored[0], scored[1]
-    ambiguous = abs(score_exe(top, game_dir, stem) - score_exe(second, game_dir, stem)) <= 3
+    ambiguous = abs(score(top) - score(second)) <= 3
     return scored, None if ambiguous else top
 
 
@@ -374,6 +376,30 @@ def extract_archive(archive: Path, dest: Path) -> None:
             tf.extractall(dest)
     else:
         raise RuntimeError(f"Unsupported archive format: {archive.suffix}")
+
+
+def place_extracted(staging: Path, archive_stem: str) -> tuple:
+    """Move a freshly extracted archive from its staging folder into GAMES_DIR.
+
+    ExoDOS archives hold a single folder named with the game's ExoDOS id
+    (e.g. 'Syndicate Plus (1994).7z' holds 'Syndicat'), so that folder becomes
+    games\\Syndicat. Archives with anything else at the top level go to
+    games\\<archive name> as before.
+    Returns (dest, depth_offset) — depth_offset is 1 when the top-level folder
+    was lifted out, so detect_exe still scores files as they sat in the archive.
+    """
+    items = list(staging.iterdir())
+    if len(items) == 1 and items[0].is_dir():
+        src, dest, depth_offset = items[0], GAMES_DIR / items[0].name, 1
+    else:
+        src, dest, depth_offset = staging, GAMES_DIR / archive_stem, 0
+    if dest.exists():
+        # Re-import: extract over the existing folder, keeping save games
+        shutil.copytree(src, dest, dirs_exist_ok=True)
+    else:
+        shutil.move(str(src), str(dest))
+    shutil.rmtree(staging, ignore_errors=True)
+    return dest, depth_offset
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -866,26 +892,32 @@ class App:
                     parent=self.root):
                 return
 
-        stem = archive.stem.split(".")[0]
-        dest = GAMES_DIR / stem
         GAMES_DIR.mkdir(exist_ok=True)
 
         threading.Thread(
             target=self._ingest_thread,
-            args=(archive, dest, stem),
+            args=(archive,),
             daemon=True,
         ).start()
 
-    def _ingest_thread(self, archive: Path, dest: Path, stem: str):
+    def _ingest_thread(self, archive: Path):
         """Worker: extract, detect EXE, update library."""
+        archive_stem = archive.stem.split(".")[0]
+        staging      = GAMES_DIR / (".importing-" + archive_stem)
         try:
-            dest.mkdir(exist_ok=True)
-            extract_archive(archive, dest)
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir()
+            extract_archive(archive, staging)
+            dest, depth_offset = place_extracted(staging, archive_stem)
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Extraction Failed", str(e), parent=self.root))
+            shutil.rmtree(staging, ignore_errors=True)
+            msg = str(e)
+            self.root.after(0, lambda: messagebox.showerror("Extraction Failed", msg, parent=self.root))
             return
 
-        exes, best = detect_exe(dest, stem)
+        # Name and look the game up by its folder (the ExoDOS id for ExoDOS archives)
+        stem = dest.name
+        exes, best = detect_exe(dest, stem, depth_offset)
 
         if not exes:
             shutil.rmtree(dest, ignore_errors=True)
@@ -895,8 +927,8 @@ class App:
                 parent=self.root))
             return
 
-        display_name = stem.replace("-", " ").replace("_", " ").title()
-        exo = lookup_exodos(display_name)
+        display_name = archive_stem.replace("-", " ").replace("_", " ").title()
+        exo = lookup_exodos(stem.replace("-", " ").replace("_", " ").title())
 
         # ExoDOS match found — apply silently, no popup
 
