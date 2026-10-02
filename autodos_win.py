@@ -94,6 +94,37 @@ def detect_cd_source(game_dir: Path) -> list:
     return []
 
 
+# CD formats DOSBox Staging can mount: ISO, CUE+BIN, CUE+ISO, and CUE+ISO with
+# FLAC/OPUS/OGG/MP3/WAV audio tracks (no CHD, MDF/MDS or CCD)
+DISC_EXTS = {".cue", ".iso", ".bin", ".img"}
+
+
+def find_game_discs(game_dir: Path) -> list:
+    """Disc images to mount as D: for a game added from an archive.
+
+    Looks in the game's CD folder (e.g. ExoDOS's Syndicat\\CD) for .cue, .iso,
+    .bin and .img images, plus any .cue or .iso at the top of the game folder.
+    Loose .bin/.img files elsewhere are skipped, since DOS games often ship
+    data files with those extensions. Files a .cue points to (its .bin/.iso
+    and audio tracks) are left for the .cue to load.
+    """
+    if not game_dir.is_dir():
+        return []
+    images = [f for f in sorted(game_dir.iterdir())
+              if f.is_file() and f.suffix.lower() in (".cue", ".iso")]
+    for child in sorted(game_dir.iterdir()):
+        if child.is_dir() and child.name.lower() in CD_FOLDER_NAMES:
+            images += [f for f in sorted(child.iterdir())
+                       if f.is_file() and f.suffix.lower() in DISC_EXTS]
+    tracks = set()
+    for cue in (f for f in images if f.suffix.lower() == ".cue"):
+        for line in cue.read_text(errors="ignore").splitlines():
+            m = re.match(r'\s*FILE\s+(?:"([^"]+)"|(\S+))', line, re.IGNORECASE)
+            if m:
+                tracks.add(os.path.normcase(str(cue.parent / (m.group(1) or m.group(2)))))
+    return [str(f) for f in images if os.path.normcase(str(f)) not in tracks]
+
+
 def scan_iso_for_exes(iso_path: str) -> list:
     """Scan an ISO 9660 disc image for game executables using pycdlib.
     Returns list of uppercase exe filenames e.g. ['WC3.EXE', 'INSTALL.EXE']
@@ -1104,7 +1135,9 @@ class App:
 
         extracted = Path(entry["extracted_path"])
         exe_rel   = entry.get("exe_path", "")
-        cd_isos   = entry.get("cd_isos", [])
+        # Add CD games store their discs; for games added from an archive, mount
+        # any disc images in the game's CD folder as D: (e.g. ExoDOS CD games)
+        cd_isos   = entry["cd_isos"] if "cd_isos" in entry else find_game_discs(extracted)
         cd_mount  = entry.get("cd_mount", False)
         cd_exe    = entry.get("cd_exe", "")
         binary, prefix = self.dosbox
