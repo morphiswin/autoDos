@@ -4,9 +4,12 @@ import json
 import re
 import os
 import shutil
+import stat
 import subprocess
 import tarfile
+import tempfile
 import threading
+import time
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -41,6 +44,8 @@ DOSBOX_FLATPAK  = "io.github.dosbox-staging"
 DOSBOX_WIN_PATH = BASE_DIR / "dosbox" / "dosbox.exe"
 TOOLS_7ZA       = TOOLS_DIR / "7za.exe"
 TOOLS_UNRAR     = TOOLS_DIR / "unrar.exe"
+# Run console tools like 7za.exe without flashing up a console window
+_NO_WINDOW      = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 BG              = "#f0ece8"
 LIST_BG         = "#ffffff"
@@ -82,7 +87,7 @@ def detect_cd_source(game_dir: Path) -> list:
         images += list(game_dir.rglob(f"*{ext}"))
         images += list(game_dir.rglob(f"*{ext.upper()}"))
     if images:
-        return sorted(str(f) for f in set(images))
+        return [str(f) for f in drop_cue_tracks(sorted(set(images), key=_disc_order))]
     for child in game_dir.iterdir():
         if child.is_dir() and child.name.lower() in CD_FOLDER_NAMES:
             found = []
@@ -90,13 +95,88 @@ def detect_cd_source(game_dir: Path) -> list:
                 found += list(child.glob(f"*{ext}"))
                 found += list(child.glob(f"*{ext.upper()}"))
             if found:
-                return sorted(str(f) for f in set(found))
+                return [str(f) for f in drop_cue_tracks(sorted(set(found), key=_disc_order))]
     return []
 
 
 # CD formats DOSBox Staging can mount: ISO, CUE+BIN, CUE+ISO, and CUE+ISO with
 # FLAC/OPUS/OGG/MP3/WAV audio tracks (no CHD, MDF/MDS or CCD)
 DISC_EXTS = {".cue", ".iso", ".bin", ".img"}
+
+# Folders games keep their CD images in (not 'disk' folders, which usually
+# hold floppy images)
+GAME_CD_FOLDERS = {"cd", "cds", "cdrom", "cd-rom", "cd1", "cd2", "cd3", "cd4",
+                   "disc", "disc1", "disc2", "disc3", "disc4", "dvd"}
+
+
+def _natural_key(name: str) -> list:
+    """Sort key that puts 'Disc 2' before 'Disc 10'."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def _disc_order(path: Path) -> tuple:
+    return _natural_key(path.name), _natural_key(path.parent.name)
+
+
+def cue_files(cue: Path) -> list:
+    """Paths of the files a .cue sheet loads (its .bin/.iso data track and any
+    audio tracks), in order."""
+    data = cue.read_bytes()
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    files = []
+    for line in text.splitlines():
+        m = re.match(r'\s*FILE\s+(?:"([^"]+)"|(\S+))', line, re.IGNORECASE)
+        if m:
+            files.append(os.path.normpath(str(cue.parent / (m.group(1) or m.group(2)))))
+    return files
+
+
+def drop_cue_tracks(images: list) -> list:
+    """Leave out the files a .cue in the list loads itself, so a CUE+BIN set
+    mounts as one disc. A .bin named like a .cue beside it counts as that
+    cue's track even if the cue sheet can't be read."""
+    tracks, cue_stems = set(), set()
+    for f in images:
+        if f.suffix.lower() == ".cue":
+            try:
+                tracks.update(os.path.normcase(p) for p in cue_files(f))
+            except OSError:
+                pass
+            cue_stems.add(os.path.normcase(str(f.with_suffix(""))))
+    return [f for f in images
+            if os.path.normcase(os.path.normpath(str(f))) not in tracks
+            and not (f.suffix.lower() == ".bin"
+                     and os.path.normcase(str(f.with_suffix(""))) in cue_stems)]
+
+
+def disc_data_file(image: str) -> str:
+    """The file holding a disc's data: a .cue sheet's first track, otherwise
+    the image itself."""
+    if image.lower().endswith(".cue"):
+        try:
+            files = cue_files(Path(image))
+        except OSError:
+            files = []
+        if files:
+            return files[0]
+    return image
+
+
+def mountable_disc(image: str) -> str:
+    """The image to hand DOSBox's imgmount. DOSBox can't read a .cue sheet
+    saved with a UTF-8 byte order mark, so for one of those its data track is
+    mounted instead (without the CD audio tracks)."""
+    if image.lower().endswith(".cue"):
+        try:
+            with open(image, "rb") as f:
+                if f.read(3) == b"\xef\xbb\xbf":
+                    return disc_data_file(image)
+        except OSError:
+            pass
+    return image
 
 
 def find_game_discs(game_dir: Path) -> list:
@@ -110,19 +190,13 @@ def find_game_discs(game_dir: Path) -> list:
     """
     if not game_dir.is_dir():
         return []
-    images = [f for f in sorted(game_dir.iterdir())
+    images = [f for f in game_dir.iterdir()
               if f.is_file() and f.suffix.lower() in (".cue", ".iso")]
-    for child in sorted(game_dir.iterdir()):
-        if child.is_dir() and child.name.lower() in CD_FOLDER_NAMES:
-            images += [f for f in sorted(child.iterdir())
+    for child in game_dir.iterdir():
+        if child.is_dir() and child.name.lower() in GAME_CD_FOLDERS:
+            images += [f for f in child.iterdir()
                        if f.is_file() and f.suffix.lower() in DISC_EXTS]
-    tracks = set()
-    for cue in (f for f in images if f.suffix.lower() == ".cue"):
-        for line in cue.read_text(errors="ignore").splitlines():
-            m = re.match(r'\s*FILE\s+(?:"([^"]+)"|(\S+))', line, re.IGNORECASE)
-            if m:
-                tracks.add(os.path.normcase(str(cue.parent / (m.group(1) or m.group(2)))))
-    return [str(f) for f in images if os.path.normcase(str(f)) not in tracks]
+    return [str(f) for f in drop_cue_tracks(sorted(images, key=_disc_order))]
 
 
 def scan_iso_for_exes(iso_path: str) -> list:
@@ -299,8 +373,13 @@ DOSBOX_WRAPPER_NAMES = {"dosbox", "dosbox-staging", "scummvm", "boxer"}
 # Known good launcher bat names inside game subfolders
 GOOD_BAT_NAMES = {"command.bat", "play.bat", "start.bat", "game.bat", "run.bat", "launch.bat"}
 
+# DOS utilities often shipped beside a game (e.g. ASKECHO.COM in ExoDOS menus)
+DOS_UTILITY_COMS = {"command", "mouse", "keyb", "ansi", "doskey", "choice",
+                    "askecho", "mode", "more", "debug", "edit", "graphics",
+                    "format", "sys", "loadfix", "setver", "share", "lh"}
+
 def score_exe(exe: Path, root: Path, stem: str, depth_offset: int = 0) -> int:
-    """Score an EXE/BAT candidate; higher = more likely the main game launcher."""
+    """Score an EXE/COM/BAT candidate; higher = more likely the main game launcher."""
     name     = exe.name.lower()
     namestem = exe.stem.lower()
     ext      = exe.suffix.lower()
@@ -331,8 +410,15 @@ def score_exe(exe: Path, root: Path, stem: str, depth_offset: int = 0) -> int:
         score += 1
 
     # ── Exact exe name match to game stem ─────────────────────────────────────
-    if namestem == stem.lower() and ext == ".exe":
+    if namestem == stem.lower() and ext in (".exe", ".com"):
         score += 10
+
+    # ── .COM files: picked over an .EXE beside them only when named after the
+    #    game (many early games only have a .COM, e.g. SIERRA.COM, DIGGER.COM)
+    if ext == ".com":
+        score -= 4
+        if namestem in DOS_UTILITY_COMS:
+            score -= 6
 
     # ── Penalise emulator folders ──────────────────────────────────────────────
     parent_name = exe.parent.name.lower()
@@ -356,11 +442,12 @@ def score_exe(exe: Path, root: Path, stem: str, depth_offset: int = 0) -> int:
 
 def detect_exe(game_dir: Path, stem: str, depth_offset: int = 0) -> tuple:
     """Return (all_launchers, best_guess) from extracted game directory.
-    Considers both .exe and .bat files; best score wins automatically.
+    Considers .exe, .com and .bat files; best score wins automatically.
     """
-    exes = list(game_dir.rglob("*.exe")) + list(game_dir.rglob("*.EXE"))
-    bats = list(game_dir.rglob("*.bat")) + list(game_dir.rglob("*.BAT"))
-    all_files = list({f.resolve() for f in exes + bats})
+    found = set()
+    for pattern in ("*.exe", "*.EXE", "*.com", "*.COM", "*.bat", "*.BAT"):
+        found.update(game_dir.rglob(pattern))
+    all_files = sorted(found)
     if not all_files:
         return [], None
     if len(all_files) == 1:
@@ -386,7 +473,8 @@ def extract_archive(archive: Path, dest: Path) -> None:
             raise RuntimeError("7za.exe not found. Place it in the tools\\ folder.")
         result = subprocess.run(
             [sevenzip, "x", str(archive), "-o" + str(dest), "-y"],
-            capture_output=True, text=True
+            capture_output=True, text=True, errors="replace",
+            creationflags=_NO_WINDOW
         )
         if result.returncode != 0:
             raise RuntimeError("7z extraction failed: " + (result.stderr or result.stdout))
@@ -398,7 +486,8 @@ def extract_archive(archive: Path, dest: Path) -> None:
             raise RuntimeError("7za.exe not found. Place it in the tools\\ folder.")
         result = subprocess.run(
             [sevenzip, "x", str(archive), "-o" + str(dest), "-y"],
-            capture_output=True, text=True
+            capture_output=True, text=True, errors="replace",
+            creationflags=_NO_WINDOW
         )
         if result.returncode != 0:
             raise RuntimeError("RAR extraction failed: " + (result.stderr or result.stdout))
@@ -409,28 +498,77 @@ def extract_archive(archive: Path, dest: Path) -> None:
         raise RuntimeError(f"Unsupported archive format: {archive.suffix}")
 
 
-def place_extracted(staging: Path, archive_stem: str) -> tuple:
-    """Move a freshly extracted archive from its staging folder into GAMES_DIR.
+def archive_base_name(archive: Path) -> str:
+    """Archive file name without its extension, e.g. 'Dr. Doom (1990)' for
+    'Dr. Doom (1990).7z' (only the archive extension goes, not every dot)."""
+    name = archive.name
+    for suffix in (".tar.gz", ".tar.bz2", ".tar.xz"):
+        if name.lower().endswith(suffix):
+            return name[:-len(suffix)].rstrip(" .") or name
+    return archive.stem.rstrip(" .") or name
 
-    ExoDOS archives hold a single folder named with the game's ExoDOS id
-    (e.g. 'Syndicate Plus (1994).7z' holds 'Syndicat'), so that folder becomes
-    games\\Syndicat. Archives with anything else at the top level go to
-    games\\<archive name> as before.
-    Returns (dest, depth_offset) — depth_offset is 1 when the top-level folder
-    was lifted out, so detect_exe still scores files as they sat in the archive.
+
+def remove_tree(path: Path) -> None:
+    """Delete a folder tree, clearing read-only flags (common on files copied
+    off CDs) that would otherwise stop the delete part-way. Never raises."""
+    def retry_writable(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    if _sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry_writable)
+    else:
+        shutil.rmtree(path, onerror=retry_writable)
+
+
+def move_into(src: Path, dest: Path) -> None:
+    """Move an extracted game folder to dest. If dest already exists (the same
+    game imported again), copy over it instead so files the game has written
+    there, like save games, are kept."""
+    if not dest.exists():
+        for _ in range(20):
+            try:
+                os.rename(src, dest)
+                return
+            except PermissionError:
+                time.sleep(0.25)  # e.g. a virus scanner still checking the new files
+            except OSError:
+                break
+        shutil.copytree(src, dest)  # couldn't rename it; the staging copy is removed after
+        return
+
+    def copy_over(s, d):
+        if os.path.exists(d):
+            os.chmod(d, stat.S_IWRITE)  # read-only files copied off a CD
+        return shutil.copy2(s, d)
+
+    shutil.copytree(src, dest, dirs_exist_ok=True, copy_function=copy_over)
+
+
+def dosbox_cycles_args(cycles) -> list:
+    """DOSBox -set arguments for a game's cycles value, as ExoDOS gives it.
+
+    'auto' (3000 cycles for real mode programs, max for protected mode), 'max',
+    'fixed N' and plain N become DOSBox Staging's cpu_cycles and
+    cpu_cycles_protected settings. Values with a limit ('max limit 35000',
+    'auto limit 20000') go to DOSBox's classic 'cycles' setting unchanged,
+    which still applies them exactly. A missing or unknown value counts as
+    'auto'.
     """
-    items = list(staging.iterdir())
-    if len(items) == 1 and items[0].is_dir():
-        src, dest, depth_offset = items[0], GAMES_DIR / items[0].name, 1
+    value  = str(cycles or "").strip()
+    s      = value.lower()
+    number = re.fullmatch(r"(?:fixed\s+)?(\d+)", s)
+    if number:
+        real = protected = str(min(max(int(number.group(1)), 50), 2000000))
+    elif s == "max":
+        real = protected = "max"
+    elif re.fullmatch(r"(auto|max)\s.*", s):
+        return ["-set", f"cycles={value}"]
     else:
-        src, dest, depth_offset = staging, GAMES_DIR / archive_stem, 0
-    if dest.exists():
-        # Re-import: extract over the existing folder, keeping save games
-        shutil.copytree(src, dest, dirs_exist_ok=True)
-    else:
-        shutil.move(str(src), str(dest))
-    shutil.rmtree(staging, ignore_errors=True)
-    return dest, depth_offset
+        real, protected = "3000", "max"
+    return ["-set", f"cpu_cycles={real}", "-set", f"cpu_cycles_protected={protected}"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -933,70 +1071,129 @@ class App:
 
     def _ingest_thread(self, archive: Path):
         """Worker: extract, detect EXE, update library."""
-        archive_stem = archive.stem.split(".")[0]
-        staging      = GAMES_DIR / (".importing-" + archive_stem)
+        archive_stem = archive_base_name(archive)
         try:
-            shutil.rmtree(staging, ignore_errors=True)
-            staging.mkdir()
-            extract_archive(archive, staging)
-            dest, depth_offset = place_extracted(staging, archive_stem)
+            GAMES_DIR.mkdir(parents=True, exist_ok=True)
+            staging = Path(tempfile.mkdtemp(prefix=".importing-", dir=GAMES_DIR))
+        except OSError as e:
+            self._show_error_later("Extraction Failed", str(e))
+            return
+        try:
+            try:
+                extract_archive(archive, staging)
+            except Exception as e:
+                self._show_error_later("Extraction Failed", str(e))
+                return
+
+            items = list(staging.iterdir())
+            if len(items) == 1 and items[0].is_dir():
+                # ExoDOS archives hold one folder named with the game's ExoDOS
+                # id (e.g. 'Syndicat'): it becomes games\Syndicat, and the game
+                # is named and looked up by it. depth_offset keeps exe scoring
+                # as if the files were still inside that folder.
+                src, stem, depth_offset = items[0], items[0].name, 1
+            else:
+                src, stem, depth_offset = staging, archive_stem, 0
+
+            if not detect_exe(src, stem, depth_offset)[0]:
+                self._show_error_later(
+                    "No Executable Found",
+                    "No .exe, .com or .bat files were found in this archive.")
+                return
+
+            dest = self._free_game_folder(stem, archive.name)
+            move_into(src, dest)
+            exes, best = detect_exe(dest, stem, depth_offset)
+
+            exo = lookup_exodos(stem.replace("-", " ").replace("_", " ").title())
+            display_name = (archive_stem if " " in archive_stem else
+                            archive_stem.replace("-", " ").replace("_", " ").title())
+
+            # ExoDOS match found — apply silently, no popup
+
+            entry = {
+                "id":             dest.name,
+                "name":           exo["title"] if exo and exo.get("title") else display_name,
+                "archive_name":   archive.name,
+                "extracted_path": str(dest),
+                "exe_path":       "",
+                "date_added":     str(date.today()),
+                "cycles":         str(exo.get("cycles") or "auto") if exo else "auto",
+                "memsize":        snap_memsize(int(exo["memsize"])) if exo and exo.get("memsize") else 16,
+                "xms":            bool(exo.get("xms", True)) if exo else True,
+                "ems":            bool(exo.get("ems", True)) if exo else True,
+                "depth_offset":   depth_offset,
+            }
         except Exception as e:
-            shutil.rmtree(staging, ignore_errors=True)
-            msg = str(e)
-            self.root.after(0, lambda: messagebox.showerror("Extraction Failed", msg, parent=self.root))
+            self._show_error_later("Import Failed", str(e))
             return
+        finally:
+            remove_tree(staging)
 
-        # Name and look the game up by its folder (the ExoDOS id for ExoDOS archives)
-        stem = dest.name
-        exes, best = detect_exe(dest, stem, depth_offset)
+        def finish():
+            if best:
+                entry["exe_path"] = str(best.relative_to(dest))
+                self._add_to_library(entry)
+                RenameModal(self.root, entry, on_save=self._on_rename_saved,
+                            then=lambda: self._launch_entry(entry))
+            else:
+                ExePickerModal(self.root, exes, dest, entry,
+                               on_confirm=self._on_exe_picked)
+        self.root.after(0, finish)
 
-        if not exes:
-            shutil.rmtree(dest, ignore_errors=True)
-            self.root.after(0, lambda: messagebox.showerror(
-                "No Executable Found",
-                "No .exe files were found in this archive.",
-                parent=self.root))
-            return
+    def _show_error_later(self, title: str, message: str):
+        """Show an error box from a worker thread."""
+        self.root.after(0, lambda: messagebox.showerror(
+            title, message or "Unknown error", parent=self.root))
 
-        display_name = archive_stem.replace("-", " ").replace("_", " ").title()
-        exo = lookup_exodos(stem.replace("-", " ").replace("_", " ").title())
+    def _free_game_folder(self, name: str, archive_name: str) -> Path:
+        """games\\<name> for a new import, or games\\<name> (2), (3)... if that
+        folder already belongs to a different game in the library. Importing
+        the same archive again reuses its folder."""
+        library = list(self.library)
 
-        # ExoDOS match found — apply silently, no popup
+        def taken(folder: Path) -> bool:
+            if not folder.exists():
+                return False
+            if not folder.is_dir():
+                return True
+            key = os.path.normcase(os.path.abspath(folder))
+            return any(e.get("extracted_path")
+                       and os.path.normcase(os.path.abspath(e["extracted_path"])) == key
+                       and e.get("archive_name") != archive_name
+                       for e in library)
 
-        entry = {
-            "id":             stem,
-            "name":           exo["title"] if exo and "title" in exo else display_name,
-            "archive_name":   archive.name,
-            "extracted_path": str(dest),
-            "exe_path":       "",
-            "date_added":     str(date.today()),
-            "cycles":         str(exo["cycles"]) if exo and "cycles" in exo else "3000",
-            "memsize":        snap_memsize(int(exo["memsize"])) if exo and "memsize" in exo else 16,
-            "xms":            bool(exo.get("xms", True)) if exo else True,
-            "ems":            bool(exo.get("ems", True)) if exo else True,
-        }
+        folder, n = GAMES_DIR / name, 2
+        while taken(folder):
+            folder, n = GAMES_DIR / f"{name} ({n})", n + 1
+        return folder
 
-        if best:
-            entry["exe_path"] = str(best.relative_to(dest))
-            self.library.append(entry)
-            self._save_library()
-            self.root.after(0, self._refresh_list)
-            self.root.after(0, lambda: RenameModal(
-                self.root, entry, on_save=self._on_rename_saved,
-                then=lambda: self._launch_entry(entry)))
-        else:
-            self.root.after(0, lambda: ExePickerModal(
-                self.root, exes, dest, entry,
-                on_confirm=self._on_exe_picked,
-            ))
+    def _add_to_library(self, entry: dict):
+        """Add a newly imported game. Importing the same archive again replaces
+        its old entry, keeping the name and controller mapping set for it, and
+        ids stay unique so renames and settings reach the right game."""
+        old = [e for e in self.library if e.get("archive_name") == entry["archive_name"]]
+        if old:
+            entry["name"] = old[0].get("name") or entry["name"]
+            if old[0].get("controller_map"):
+                entry["controller_map"] = old[0]["controller_map"]
+            self.library = [e for e in self.library if not any(e is o for o in old)]
+        ids = {e["id"] for e in self.library}
+        base, n = entry["id"], 2
+        while entry["id"] in ids:
+            entry["id"], n = f"{base} ({n})", n + 1
+        self.library.append(entry)
+        self._save_library()
+        self._refresh_list()
 
     def _on_exe_picked(self, entry: dict, chosen: Path, dest: Path):
         """Called when user picks an EXE from the picker modal."""
         entry["exe_path"] = str(chosen.relative_to(dest))
-        self.library = [e for e in self.library if e["id"] != entry["id"]]
-        self.library.append(entry)
-        self._save_library()
-        self._refresh_list()
+        if any(e is entry for e in self.library):
+            self._save_library()           # Change EXE on a game already listed
+            self._refresh_list()
+        else:
+            self._add_to_library(entry)    # finishing a new import
         RenameModal(self.root, entry, on_save=self._on_rename_saved,
                     then=lambda: self._launch_entry(entry))
 
@@ -1044,8 +1241,8 @@ class App:
             "extracted_path": str(dest),
             "exe_path":       "",
             "date_added":     str(date.today()),
-            "cycles":         str(exo["cycles"]) if exo and "cycles" in exo else "3000",
-            "memsize":        snap_memsize(int(exo["memsize"])) if exo and "memsize" in exo else 16,
+            "cycles":         str(exo.get("cycles") or "auto") if exo else "auto",
+            "memsize":        snap_memsize(int(exo["memsize"])) if exo and exo.get("memsize") else 16,
             "xms":            bool(exo.get("xms", True)) if exo else True,
             "ems":            bool(exo.get("ems", True)) if exo else True,
             "cd_isos":        cd_isos,
@@ -1062,8 +1259,8 @@ class App:
             self.root.after(0, lambda: self._launch_entry(entry))
             return
 
-        # No ExoDOS exe — scan first ISO with 7za to find candidates
-        exe_candidates = scan_iso_for_exes(cd_isos[0])
+        # No ExoDOS exe — scan the first disc's data track for candidates
+        exe_candidates = scan_iso_for_exes(disc_data_file(cd_isos[0]))
 
         if not exe_candidates:
             # Nothing found in ISO — add to library, user can set via Game Settings
@@ -1135,36 +1332,29 @@ class App:
 
         extracted = Path(entry["extracted_path"])
         exe_rel   = entry.get("exe_path", "")
-        # Add CD games store their discs; for games added from an archive, mount
-        # any disc images in the game's CD folder as D: (e.g. ExoDOS CD games)
-        cd_isos   = entry["cd_isos"] if "cd_isos" in entry else find_game_discs(extracted)
+        # Add CD games store their discs (older entries can list a .cue's .bin
+        # as an extra disc, so those tracks are dropped again here)
+        cd_isos   = [str(f) for f in drop_cue_tracks([Path(p) for p in entry.get("cd_isos", [])])]
         cd_mount  = entry.get("cd_mount", False)
         cd_exe    = entry.get("cd_exe", "")
         binary, prefix = self.dosbox
 
-        # ── Cycles ───────────────────────────────────────────────────────────
-        import re as _re
-        cycles_str  = str(entry.get("cycles", "3000"))
-        memsize     = snap_memsize(int(entry.get("memsize", 16)))
-        # ExoDOS cycles come as N, 'max', 'auto', 'max limit N', 'auto limit N'
-        # or 'fixed N'; DOSBox Staging's cpu_cycles only takes N or 'max'
-        cycles_num  = _re.search(r"\d+", cycles_str)
-        if cycles_num:
-            conf_cycles = cycles_num.group(0)
-        elif cycles_str.lower() in ("max", "auto"):
-            conf_cycles = "max"
-        else:
-            conf_cycles = cycles_str
-
-        # Memory, EMS and XMS can only be set before DOSBox starts. Passed as
-        # -set so they override dosbox.conf ('set memsize=' in the DOS shell
-        # only sets an environment variable).
-        base_args = ["-conf", str(ASSET_DIR / "dosbox.conf"),
-                     "-set", f"memsize={memsize}",
-                     "-set", f"ems={str(bool(entry.get('ems', True))).lower()}",
-                     "-set", f"xms={str(bool(entry.get('xms', True))).lower()}"]
+        # ── Per-game DOSBox settings ─────────────────────────────────────────
+        # Passed with -set so they override dosbox.conf before DOSBox starts:
+        # memory, EMS and XMS can't change once it's running ('set memsize='
+        # in the DOS shell only sets an environment variable).
+        try:
+            memsize = snap_memsize(int(entry.get("memsize", 16)))
+        except (TypeError, ValueError):
+            memsize = 16
+        base_args = (["-conf", str(ASSET_DIR / "dosbox.conf")]
+                     + dosbox_cycles_args(entry.get("cycles"))
+                     + ["-set", f"memsize={memsize}",
+                        "-set", f"ems={str(bool(entry.get('ems', True))).lower()}",
+                        "-set", f"xms={str(bool(entry.get('xms', True))).lower()}"])
 
         def make_imgmount(isos):
+            isos   = [mountable_disc(iso) for iso in isos]
             quoted = " ".join(f'"{iso}"' if " " in iso else iso for iso in isos)
             return f"imgmount D {quoted} -t iso"
 
@@ -1182,8 +1372,6 @@ class App:
             run_cmd = f'"{cd_exe}"' if " " in cd_exe else cd_exe
             cmd = [binary] + prefix + base_args
             cmd += [
-                "-c", f"cpu_cycles {conf_cycles}",
-                "-c", f"cpu_cycles_protected {conf_cycles}",
                 "-c", mount_c,
                 "-c", make_imgmount(cd_isos),
                 "-c", "D:",
@@ -1204,10 +1392,19 @@ class App:
         mount_c     = f'mount c "{exe_dir_str}"' if " " in exe_dir_str else f"mount c {exe_dir_str}"
         run_cmd     = f'"{exe_name}"' if " " in exe_name else exe_name
 
+        if "cd_isos" not in entry:
+            # Games added from an archive: mount the disc images in the game's
+            # CD folder as D: (e.g. ExoDOS CD games). Looks from the exe's
+            # folder up to the game folder, which also covers games imported
+            # inside a folder named after their archive.
+            for folder in (d for d in (exe_dir, *exe_dir.parents)
+                           if d.is_relative_to(extracted)):
+                cd_isos = find_game_discs(folder)
+                if cd_isos:
+                    break
+
         cmd = [binary] + prefix + base_args
         cmd += [
-            "-c", f"cpu_cycles {conf_cycles}",
-            "-c", f"cpu_cycles_protected {conf_cycles}",
             "-c", mount_c,
         ]
         if cd_isos:
@@ -1249,7 +1446,7 @@ class App:
     def _show_exe_picker(self, entry: dict):
         """Open EXE picker modal for failed or ambiguous launch."""
         dest = Path(entry["extracted_path"])
-        exes, _ = detect_exe(dest, entry["id"])
+        exes, _ = detect_exe(dest, entry["id"], entry.get("depth_offset", 0))
         if not exes:
             messagebox.showerror("Error", "No executables found in game directory.", parent=self.root)
             return
@@ -1335,7 +1532,7 @@ class App:
             if result is None:
                 return
             if result:
-                shutil.rmtree(entry["extracted_path"], ignore_errors=True)
+                remove_tree(Path(entry["extracted_path"]))
         else:
             result = messagebox.askyesno(
                 "Remove Game",
@@ -1489,13 +1686,13 @@ class GameSettingsModal:
                            activebackground=BG, relief="flat"
                            ).grid(row=row, column=1, sticky="w", pady=5)
 
-        self.cycles_var = tk.StringVar(value=str(entry.get("cycles", "3000")))
+        self.cycles_var = tk.StringVar(value=str(entry.get("cycles") or "auto"))
         self.mem_var    = tk.StringVar(value=str(entry.get("memsize", 16)))
         self.xms_var    = tk.BooleanVar(value=bool(entry.get("xms", True)))
         self.ems_var    = tk.BooleanVar(value=bool(entry.get("ems", True)))
 
         field("CPU Cycles:", self.cycles_var, 0,
-              "e.g.  3000  |  max  |  max limit 35000")
+              "e.g.  auto  |  3000  |  max  |  max limit 35000")
         field("Mem (MB):", self.mem_var, 2)
         checkbox("XMS:", self.xms_var, 4)
         checkbox("EMS:", self.ems_var, 5)
