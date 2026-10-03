@@ -1,5 +1,8 @@
 AutoDOS — Windows Edition
 A lightweight personal DOS game launcher for Windows, built in Python with tkinter and powered by DOSBox Staging.
+
+This version includes the changes listed in [CHANGES.md](CHANGES.md).
+
 Overview
 AutoDOS lets you add DOS game archives or pre-extracted game folders to a library and launch them directly into DOSBox with no manual configuration. It handles extraction, executable detection, DOSBox settings, and CD mounting automatically.
 Tech Stack
