@@ -1,38 +1,62 @@
-AutoDOS — Windows Edition
-A lightweight personal DOS game launcher for Windows, built in Python with tkinter and powered by DOSBox Staging.
+# AutoDOS — Windows Edition
 
-This version includes the changes listed in [CHANGES.md](CHANGES.md).
+**Add a DOS game, double-click, play.** AutoDOS is a small launcher for DOS games
+on Windows. It unpacks your ZIP or 7Z archives, works out how to start each
+game, and launches it in DOSBox Staging with the settings eXoDOS recommends.
 
-Overview
-AutoDOS lets you add DOS game archives or pre-extracted game folders to a library and launch them directly into DOSBox with no manual configuration. It handles extraction, executable detection, DOSBox settings, and CD mounting automatically.
-Tech Stack
+> This is a fork of [makuka97/autoDos](https://github.com/makuka97/autoDos).
+> The changes are below, and every detail is in [CHANGES.md](CHANGES.md).
 
-Python 3.12+ — core application
-tkinter — native GUI, no external UI dependencies
-Pillow — logo rendering
-DOSBox Staging 0.82 — DOS emulation backend
-7-Zip (7za.exe) — bundled archive extraction
-PyInstaller — packages everything into a standalone Windows exe
-ExoDOS database — game compatibility data (cycles, memory, settings)
+## What's new in this fork
 
-How It Works
-Adding games — AutoDOS accepts zipped archives via Add Zip, or pre-extracted folders via Add CD. On ingest it extracts the archive, scans for executables and bat files using a scoring algorithm, applies ExoDOS settings if a match is found, and launches immediately.
-Executable detection — A scoring system ranks every exe and bat file found in the game folder. It penalises root-level Windows launcher bats, emulator subfolders, setup and sound utility files, and utility directories like ULTRASND. The highest-scoring file launches automatically. If the result is ambiguous, a picker modal lets you choose manually.
-ExoDOS integration — On ingest, the game name is matched against the ExoDOS database using exact key matching, containment matching, and token matching. When a match is found, CPU cycles, memory size, XMS, and EMS settings are applied silently. Unrecognised games default to 3000 cycles and 16MB.
-CD support — Games with disc images can have an ISO folder assigned via the Add CD button. AutoDOS sorts the ISOs alphabetically, mounts the first disc as D: in DOSBox, and instructs the user to use Ctrl+F4 inside DOSBox to swap discs when prompted.
-Launch — DOSBox is launched via subprocess with per-game cpu_cycles, memsize, and mount commands passed as -c arguments. Memory values are snapped to valid DOSBox values automatically.
-Functionality
+- 🎮 **Any controller.** DirectInput or XInput, wired or wireless. Right-click
+  a game → **Gamepad** to map each button to the joystick or a key, and test it
+  live.
+- 📦 **eXoDOS archives just work.** A game installs into its proper eXoDOS
+  folder (e.g. `games\Syndicat`), so it matches the right settings.
+- 💿 **CDs mount themselves.** ISO and CUE/BIN images in a game's CD folder
+  appear as `D:`.
+- ⚙️ **Settings that stick.** Per-game memory, EMS, XMS and every eXoDOS
+  cycles format now reach DOSBox.
+- 🔍 **Add CD finds the game.** It reads ISO and BIN discs to find the program
+  that starts it.
+- 🖥️ **Crisp fullscreen.** Direct3D output, sharp pixels and 4:3 aspect,
+  tuned for a 1600x1200 screen.
+- 🌙 **Dark theme** everywhere, plus safer imports and plenty of fixes.
 
-Add games from ZIP, 7Z, or RAR archives
-Add pre-extracted CD-based games directly from folder
-Automatic exe and bat detection with intelligent scoring
-ExoDOS database lookup with fuzzy matching
-Per-game settings — cycles, memory, XMS, EMS, CD path
-Live ExoDOS search in game settings for manual tuning
-Right-click context menu — change exe, game settings, remove
-Multi-disc support with Ctrl+F4 swap instructions
-Persistent game library stored in library.json
-Standalone exe via PyInstaller — no Python installation required
+## Using it
 
-Credits
-Game compatibility data sourced from the ExoDOS collection. DOSBox Staging developed by the DOSBox Staging team.
+1. Put `AutoDOS.exe` next to the `dosbox\` folder (DOSBox Staging 0.82.2) and
+   the `tools\` folder (`7za.exe`).
+2. Click **Add Zip** and pick a game archive. It unpacks, sets itself up and
+   launches.
+3. Double-click a game to play it. Right-click it for Game Settings, Gamepad,
+   Change EXE, Rename or Remove.
+
+**Tip:** switch your controller on *before* starting a game. DOSBox only looks
+for controllers when a game starts.
+
+## Features
+
+- Picks each game's program automatically, and asks when it isn't sure
+- Built-in eXoDOS database of 7,600+ games for cycles, memory, EMS and XMS
+- Tweak any game's settings, or search the database and apply another entry
+- Multi-disc games: press Ctrl+F4 in DOSBox to swap discs
+- Searchable library, saved in `library.json` next to the exe
+- One standalone exe, no Python needed
+
+## Building
+
+```
+python -m PyInstaller AutoDOS.spec
+```
+
+You need Python 3.12 with Pillow and PyInstaller. The display settings in
+`dosbox.conf` are built into the exe, so rebuild after changing them.
+
+## Credits
+
+The original AutoDOS is by [makuka97](https://github.com/makuka97). Game
+settings come from the [eXoDOS](https://www.retro-exo.com/exodos.html)
+collection. Emulation is by
+[DOSBox Staging](https://dosbox-staging.github.io).
