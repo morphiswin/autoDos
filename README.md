@@ -12,7 +12,7 @@ game, and launches it in DOSBox Staging with the settings eXoDOS recommends.
 - 🎮 **Any controller.** DirectInput or XInput, wired or wireless. Right-click
   a game → **Gamepad** to map each button to the joystick or a key, and test it
   live.
-- 📦 **eXoDOS archives just work.** A game installs into its proper eXoDOS
+- 📦 **eXoDOS archives** A game installs into its proper eXoDOS
   folder (e.g. `games\Syndicat`), so it matches the right settings.
 - 💿 **CDs mount themselves.** ISO and CUE/BIN images in a game's CD folder
   appear as `D:`.
@@ -23,9 +23,7 @@ game, and launches it in DOSBox Staging with the settings eXoDOS recommends.
 - 📝 **One settings file.** Every DOSBox setting lives in `dosbox.conf` next
   to `AutoDOS.exe`. Edit it and the next game you start uses it. No hidden
   copies.
-- 🖥️ **Crisp fullscreen.** Direct3D output, sharp pixels and 4:3 aspect,
-  tuned for a 1600x1200 screen.
-- 🌙 **Dark theme** everywhere, plus safer imports and plenty of fixes.
+- 🌙 **Dark theme**
 
 ## Using it
 
@@ -69,7 +67,6 @@ You need Python 3.12 with Pillow and PyInstaller. Ship `dosbox.conf`,
 
 ## Credits
 
-The original AutoDOS is by [makuka97](https://github.com/makuka97). Game
-settings come from the [eXoDOS](https://www.retro-exo.com/exodos.html)
-collection. Emulation is by
-[DOSBox Staging](https://dosbox-staging.github.io).
+The original AutoDOS is by [makuka97](https://github.com/makuka97). 
+Game settings come from [eXoDOS](https://www.retro-exo.com/exodos.html)
+Emulation is by [DOSBox Staging](https://dosbox-staging.github.io).
