@@ -73,6 +73,38 @@ ARCHIVE_FILTERS = [
 ]
 
 # ── CD / ISO Support ──────────────────────────────────────────────────────────
+CD_IMAGE_EXTS   = {".iso", ".bin", ".cue", ".img", ".mdf"}
+CD_FOLDER_NAMES = {"cd", "cdrom", "cd-rom", "disc", "disk", "dvd",
+                   "cd1", "cd2", "disc1", "disc2", "disk1", "disk2"}
+
+_ISO_EXE_BLACKLIST = {
+    "setup", "install", "uninst", "uninstall", "patch", "update",
+    "config", "cfg", "register", "readme", "read", "help",
+    "directx", "dxsetup", "dos4gw", "cwsdpmi", "himemx",
+    "dosbox", "scummvm", "loadpats", "intro", "movie", "logo",
+    "start", "run", "main", "fixsave", "convert",
+}
+
+
+def detect_cd_source(game_dir: Path) -> list:
+    """Scan a game folder for CD images. Returns sorted list of path strings."""
+    images = []
+    for ext in CD_IMAGE_EXTS:
+        images += list(game_dir.rglob(f"*{ext}"))
+        images += list(game_dir.rglob(f"*{ext.upper()}"))
+    if images:
+        return [str(f) for f in drop_cue_tracks(sorted(set(images), key=_disc_order))]
+    for child in game_dir.iterdir():
+        if child.is_dir() and child.name.lower() in CD_FOLDER_NAMES:
+            found = []
+            for ext in CD_IMAGE_EXTS:
+                found += list(child.glob(f"*{ext}"))
+                found += list(child.glob(f"*{ext.upper()}"))
+            if found:
+                return [str(f) for f in drop_cue_tracks(sorted(set(found), key=_disc_order))]
+    return []
+
+
 # CD formats DOSBox Staging can mount: ISO, CUE+BIN, CUE+ISO, and CUE+ISO with
 # FLAC/OPUS/OGG/MP3/WAV audio tracks (no CHD, MDF/MDS or CCD)
 DISC_EXTS = {".cue", ".iso", ".bin", ".img"}
@@ -171,6 +203,93 @@ def find_game_discs(game_dir: Path) -> list:
             images += [f for f in child.iterdir()
                        if f.is_file() and f.suffix.lower() in DISC_EXTS]
     return [str(f) for f in drop_cue_tracks(sorted(images, key=_disc_order))]
+
+
+def scan_iso_for_exes(iso_path: str, skip_blacklisted: bool = True) -> list:
+    """Scan a disc image's ISO 9660 file system for game executables.
+    Reads .iso images and .bin data tracks (raw 2352-byte CD sectors).
+    Returns paths on the disc in uppercase, root files first, e.g.
+    ['WC3.EXE', 'GAME\\PLAY.BAT']. Blacklisted names are filtered out
+    unless skip_blacklisted is False.
+    """
+    candidates = []
+    try:
+        with open(iso_path, "rb") as f:
+            # Raw CD sectors start with a 12-byte sync pattern; their 2048 data
+            # bytes follow the header (16 bytes in mode 1, 24 in mode 2)
+            head = f.read(16)
+            if head[:12] == b"\x00" + b"\xff" * 10 + b"\x00":
+                size, skip = 2352, (24 if head[15] == 2 else 16)
+            else:
+                size, skip = 2048, 0
+
+            def read(lba: int, length: int) -> bytes:
+                data = b""
+                for n in range(min((length + 2047) // 2048, 512)):
+                    f.seek((lba + n) * size + skip)
+                    data += f.read(2048)
+                return data
+
+            # Find the primary volume descriptor (from sector 16 on)
+            root = None
+            for lba in range(16, 32):
+                vd = read(lba, 2048)
+                if vd[1:6] != b"CD001" or vd[0] == 255:
+                    break
+                if vd[0] == 1:
+                    root = vd[156:190]
+                    break
+            if not root:
+                return []
+
+            seen, visited = set(), set()
+
+            def walk(lba: int, length: int, folder: str, depth: int):
+                if depth > 8 or lba in visited:
+                    return
+                visited.add(lba)
+                data, pos = read(lba, length), 0
+                while pos + 34 <= len(data):
+                    rec_len = data[pos]
+                    if rec_len == 0:            # rest of this sector is padding
+                        pos = (pos // 2048 + 1) * 2048
+                        continue
+                    rec, pos = data[pos:pos + rec_len], pos + rec_len
+                    if len(rec) < 34:                # damaged record
+                        continue
+                    raw = rec[33:33 + rec[32]]
+                    if raw in (b"\x00", b"\x01"):   # '.' and '..'
+                        continue
+                    name = raw.decode("ascii", "replace").upper().split(";")[0].rstrip(".")
+                    if not name:
+                        continue
+                    if rec[25] & 2:                 # a folder
+                        walk(int.from_bytes(rec[2:6], "little"),
+                             int.from_bytes(rec[10:14], "little"),
+                             folder + name + "\\", depth + 1)
+                        continue
+                    stem, _, ext = name.rpartition(".")
+                    if ext not in ("EXE", "COM", "BAT"):
+                        continue
+                    if len(stem) < 2 or (skip_blacklisted
+                                         and stem.lower() in _ISO_EXE_BLACKLIST):
+                        continue
+                    if folder + name not in seen:
+                        seen.add(folder + name)
+                        candidates.append(folder + name)
+
+            walk(int.from_bytes(root[2:6], "little"),
+                 int.from_bytes(root[10:14], "little"), "", 0)
+    except Exception:
+        return []
+
+    # Sort: root files first, then EXE, BAT, COM, then alphabetical
+    def rank(path):
+        ext = path.rsplit(".", 1)[-1]
+        return (path.count("\\"), {"EXE": 0, "BAT": 1, "COM": 2}.get(ext, 3), path)
+
+    candidates.sort(key=rank)
+    return candidates
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -499,11 +618,16 @@ def dosbox_cycles_args(cycles) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GAMEPAD — Microsoft SideWinder Game Pad (USB)
+# GAMEPAD — DirectInput and XInput controllers
 # ══════════════════════════════════════════════════════════════════════════════
-# DOSBox reads the pad itself; AutoDOS writes a DOSBox mapper file per game that
-# says what each pad control does there. A mapper file replaces all of DOSBox's
-# bindings, so it always carries DOSBox's own defaults in full.
+# DOSBox reads the controller itself; AutoDOS writes a DOSBox mapper file per
+# game that says what each control does there. A mapper file replaces all of
+# DOSBox's bindings, so it always carries DOSBox's own defaults in full.
+#
+# DOSBox reads controllers through SDL, which numbers their buttons and axes
+# differently for XInput, DirectInput and other kinds of controller, so the
+# Gamepad window reads them through DOSBox's own SDL2.dll: the numbers it
+# saves are the ones DOSBox sees.
 
 # DOSBox Staging 0.82.2's default bindings (saved from its mapper): hotkeys,
 # every keyboard key and the modifier keys
@@ -635,39 +759,79 @@ mod_2 "key 226" "key 230"
 mod_3 "key 227" "key 231"
 """
 
-# The pad's buttons and the button numbers DOSBox sees for them (SDL's
-# controller database, USB id 045e:0007). Start is button 8 on some models
-# and 9 on others, so it's bound to both.
-PAD_BUTTONS = [
-    ("a", "A", (0,)), ("b", "B", (1,)), ("c", "C", (2,)),
-    ("x", "X", (3,)), ("y", "Y", (4,)), ("z", "Z", (5,)),
-    ("l", "L trigger", (6,)), ("r", "R trigger", (7,)),
-    ("start", "Start", (8, 9)),
-]
-# Buttons that can be the joystick's fire buttons 1-4 in DOS games
-PAD_JOYSTICK_BUTTONS = {"a": 1, "b": 2, "c": 3, "x": 4}
+# A controller is a list of controls: D-pads and sticks, with the inputs that
+# push them up, down, left and right, and buttons (and triggers) with the
+# inputs that press them. Inputs are named the way DOSBox's mapper names them,
+# less the "stick_N " in front:
+#   {"id": "dpad", "label": "D-pad", "dirs": {"up": ["hat 0 1"], ...}}
+#   {"id": "a",    "label": "A",     "binds": ["button 0"]}
+PAD_DIRECTIONS = ("up", "down", "left", "right")
+PAD_INPUT = re.compile(r"button \d+|axis \d+ [01]|hat 0 [1248]")
 
-# The D-pad shows up as the stick's axes or as a hat, depending on the model
-# and driver, so each direction is bound both ways (hat: 1 up, 2 right,
-# 4 down, 8 left)
-PAD_DPAD = {
-    "up":    ("stick_0 axis 1 0", "stick_0 hat 0 1"),
-    "down":  ("stick_0 axis 1 1", "stick_0 hat 0 4"),
-    "left":  ("stick_0 axis 0 0", "stick_0 hat 0 8"),
-    "right": ("stick_0 axis 0 1", "stick_0 hat 0 2"),
+# The buttons in SDL's controller database, in the order the Gamepad window
+# lists them, named as on Xbox controllers...
+PAD_NAMES = {
+    "a": "A", "b": "B", "x": "X", "y": "Y",
+    "leftshoulder": "LB", "rightshoulder": "RB",
+    "lefttrigger": "LT", "righttrigger": "RT",
+    "back": "Back", "start": "Start", "guide": "Guide",
+    "leftstick": "Left stick click", "rightstick": "Right stick click",
+    "misc1": "Extra button", "paddle1": "Paddle 1", "paddle2": "Paddle 2",
+    "paddle3": "Paddle 3", "paddle4": "Paddle 4", "touchpad": "Touchpad",
 }
-PAD_DPAD_CHOICES = [
-    ("joystick", "Joystick"),
-    ("arrows",   "Arrow keys"),
-    ("wasd",     "W A S D"),
-    ("numpad",   "Numpad 8 4 6 2"),
-    ("none",     "Not used"),
+# ...and as on other kinds of controller, by SDL's controller type
+_PLAYSTATION_NAMES = {"a": "Cross", "b": "Circle", "x": "Square", "y": "Triangle",
+                      "leftshoulder": "L1", "rightshoulder": "R1",
+                      "lefttrigger": "L2", "righttrigger": "R2",
+                      "guide": "PS button", "leftstick": "L3", "rightstick": "R3"}
+_NINTENDO_NAMES = {"a": "B", "b": "A", "x": "Y", "y": "X",
+                   "leftshoulder": "L", "rightshoulder": "R",
+                   "lefttrigger": "ZL", "righttrigger": "ZR",
+                   "back": "Minus", "start": "Plus", "guide": "Home", "misc1": "Capture"}
+PAD_TYPE_NAMES = {
+    1: {"guide": "Xbox button"},                                       # Xbox 360
+    2: {"back": "View", "start": "Menu", "guide": "Xbox button",
+        "misc1": "Share"},                                             # Xbox One / Series
+    3: dict(_PLAYSTATION_NAMES, back="Select"),                        # PlayStation 3
+    4: dict(_PLAYSTATION_NAMES, back="Share", start="Options"),        # PlayStation 4
+    7: dict(_PLAYSTATION_NAMES, back="Create", start="Options",
+            misc1="Mic"),                                              # PlayStation 5
+    5: _NINTENDO_NAMES, 11: _NINTENDO_NAMES, 12: _NINTENDO_NAMES,
+    13: _NINTENDO_NAMES,                                               # Switch
+}
+_SDL_DPAD   = {"dpup": "up", "dpdown": "down", "dpleft": "left", "dpright": "right"}
+_SDL_STICKS = {"leftx":  ("lstick", "left", "right"), "lefty":  ("lstick", "up", "down"),
+               "rightx": ("rstick", "left", "right"), "righty": ("rstick", "up", "down")}
+
+# What a D-pad or stick can do, and the DOSBox events for each direction.
+# The PC joystick's axes 3 and 4 (and buttons 3 and 4, below) belong to the
+# first joystick when DOSBox finds one controller and to the second when it
+# finds two, so they're bound both ways.
+PAD_DIR_CHOICES = [
+    ("joystick",  "Joystick"),
+    ("joystick2", "Joystick axes 3 + 4"),
+    ("arrows",    "Arrow keys"),
+    ("wasd",      "W A S D"),
+    ("numpad",    "Numpad 8 4 6 2"),
+    ("none",      "Not used"),
 ]
-PAD_DPAD_KEYS = {
-    "arrows": {"up": "key_up", "down": "key_down", "left": "key_left", "right": "key_right"},
-    "wasd":   {"up": "key_w",  "down": "key_s",    "left": "key_a",    "right": "key_d"},
-    "numpad": {"up": "key_kp_8", "down": "key_kp_2", "left": "key_kp_4", "right": "key_kp_6"},
+PAD_DIR_EVENTS = {
+    "joystick":  {"up": ["jaxis_0_1-"], "down": ["jaxis_0_1+"],
+                  "left": ["jaxis_0_0-"], "right": ["jaxis_0_0+"]},
+    "joystick2": {"up": ["jaxis_0_3-", "jaxis_1_1-"], "down": ["jaxis_0_3+", "jaxis_1_1+"],
+                  "left": ["jaxis_0_2-", "jaxis_1_0-"], "right": ["jaxis_0_2+", "jaxis_1_0+"]},
+    "arrows":    {"up": ["key_up"], "down": ["key_down"],
+                  "left": ["key_left"], "right": ["key_right"]},
+    "wasd":      {"up": ["key_w"], "down": ["key_s"], "left": ["key_a"], "right": ["key_d"]},
+    "numpad":    {"up": ["key_kp_8"], "down": ["key_kp_2"],
+                  "left": ["key_kp_4"], "right": ["key_kp_6"]},
 }
+PAD_JOY_BUTTONS = [("joy1", "Joystick button 1"), ("joy2", "Joystick button 2"),
+                   ("joy3", "Joystick button 3"), ("joy4", "Joystick button 4")]
+PAD_JOY_EVENTS = {"joy1": ["jbutton_0_0"], "joy2": ["jbutton_0_1"],
+                  "joy3": ["jbutton_0_2", "jbutton_1_0"],
+                  "joy4": ["jbutton_0_3", "jbutton_1_1"]}
+PAD_JOYSTICK_ACTIONS = {"joystick", "joystick2", "joy1", "joy2", "joy3", "joy4"}
 
 # Keys a button can press, as (name shown, DOSBox event)
 PAD_KEYS = (
@@ -693,94 +857,221 @@ PAD_KEYS = (
        ("Right Ctrl", "key_rctrl"), ("Right Alt", "key_ralt"),
        ("Right Shift", "key_rshift"), ("Caps Lock", "key_capslock"),
        ("Pause", "key_pause"),
-       ("Left mouse button", "mouse_left"), ("Right mouse button", "mouse_right")]
+       ("Left mouse button", "mouse_left"), ("Right mouse button", "mouse_right"),
+       ("Middle mouse button", "mouse_middle")]
 )
+PAD_KEY_EVENTS = {event for _, event in PAD_KEYS}
 
 PAD_PRESETS = {
-    # Games with joystick support: D-pad and A/B/C/X are a PC joystick
-    "Joystick": {"dpad": "joystick", "a": "joystick", "b": "joystick",
-                 "c": "joystick", "x": "joystick", "y": "none", "z": "none",
-                 "l": "none", "r": "none", "start": "key_esc"},
+    # Games with joystick support: the D-pad, left stick and the four face
+    # buttons are a PC joystick, and Start presses Esc
+    "Joystick": {"dpad": "joystick", "lstick": "joystick",
+                 "a": "joy1", "b": "joy2", "x": "joy3", "y": "joy4", "start": "key_esc",
+                 # a controller SDL doesn't know: its first four buttons
+                 "button0": "joy1", "button1": "joy2", "button2": "joy3", "button3": "joy4"},
     # Keyboard-only games
-    "Keyboard": {"dpad": "arrows", "a": "key_lctrl", "b": "key_lalt",
-                 "c": "key_space", "x": "key_lshift", "y": "key_enter",
-                 "z": "key_tab", "l": "key_comma", "r": "key_period",
-                 "start": "key_esc"},
+    "Keyboard": {"dpad": "arrows", "lstick": "arrows",
+                 "a": "key_lctrl", "b": "key_space", "x": "key_lalt", "y": "key_enter",
+                 "leftshoulder": "key_lshift", "rightshoulder": "key_tab",
+                 "lefttrigger": "key_comma", "righttrigger": "key_period",
+                 "start": "key_esc",
+                 "button0": "key_lctrl", "button1": "key_space", "button2": "key_lalt",
+                 "button3": "key_enter", "button4": "key_lshift", "button5": "key_tab",
+                 "button6": "key_comma", "button7": "key_period"},
 }
 
 
-def gamepad_settings(entry: dict) -> dict:
-    """A game's pad settings: what it saved, else the Joystick preset."""
-    settings = dict(PAD_PRESETS["Joystick"])
+def pad_controls(mapping: str, buttons: int, axes: int, hats: int,
+                 rest: list, pad_type: int = 0) -> list:
+    """A controller's controls, from SDL's controller database entry for it
+    ('' if SDL doesn't know it) and its button, axis and hat counts. rest is
+    where each axis sits untouched: an axis resting at one end is a trigger."""
+    names = dict(PAD_NAMES, **PAD_TYPE_NAMES.get(pad_type, {}))
+    dirs = {"dpad": {}, "lstick": {}, "rstick": {}}
+    pressed_by = {}           # button -> the inputs that press it
+    used = set()              # inputs the database entry covers: 'b3', 'a1', 'h0'
+
+    for field in mapping.split(",")[2:]:
+        target, _, source = field.partition(":")
+        half = target[:1] if target[:1] in "+-" else ""
+        target = target.lstrip("+-")
+        m = re.fullmatch(r"([+-]?)([abh])(\d+)(?:\.([1248]))?(~?)", source.strip())
+        if not m or (m[2] == "h") != bool(m[4]):
+            continue
+        sign, kind, num, mask, inverted = m.groups()
+        num = str(int(num))
+        if kind == "h" and num != "0":
+            continue          # DOSBox only reads a controller's first hat
+        used.add(kind + num)
+
+        def press(plus=True):
+            """The input that's pressed: a button, a hat direction, or an
+            axis pushed toward its + end (its - end for plus=False)."""
+            if kind == "b":
+                return f"button {num}"
+            if kind == "h":
+                return f"hat 0 {mask}"
+            toward_plus = (sign != "-") == plus
+            return f"axis {num} {int(toward_plus != bool(inverted))}"
+
+        if target in _SDL_DPAD:
+            dirs["dpad"].setdefault(_SDL_DPAD[target], []).append(press())
+        elif target in _SDL_STICKS:
+            group, minus, plus = _SDL_STICKS[target]
+            if half:
+                dirs[group].setdefault(minus if half == "-" else plus, []).append(press())
+            else:
+                dirs[group].setdefault(minus, []).append(press(False))
+                dirs[group].setdefault(plus, []).append(press())
+        elif target in PAD_NAMES:
+            pressed_by.setdefault(target, []).append(press())
+
+    sticks = [{"id": group, "label": label, "dirs": dirs[group]}
+              for group, label in (("dpad", "D-pad"), ("lstick", "Left stick"),
+                                   ("rstick", "Right stick")) if dirs[group]]
+    pressables = [{"id": button, "label": names[button], "binds": pressed_by[button]}
+                  for button in PAD_NAMES if button in pressed_by]
+
+    # Inputs the database entry leaves out (all of them for a controller SDL
+    # doesn't know). DOSBox reads up to 10 axes and 36 buttons.
+    taken = {c["id"] for c in sticks}
+
+    def free_id(*ids):
+        free = next((i for i in ids if i not in taken), ids[-1])
+        taken.add(free)
+        return free
+
+    if hats > 0 and "h0" not in used:
+        sticks.append({"id": free_id("dpad", "hat0"), "label": "D-pad",
+                       "dirs": {"up": ["hat 0 1"], "down": ["hat 0 4"],
+                                "left": ["hat 0 8"], "right": ["hat 0 2"]}})
+    free_axes = [a for a in range(min(axes, 10)) if f"a{a}" not in used]
+    triggers = [a for a in free_axes if a < len(rest) and abs(rest[a]) > 24000]
+    stick_axes = [a for a in free_axes if a not in triggers]
+    for x, y in zip(stick_axes[::2], stick_axes[1::2]):
+        group = free_id("lstick", "rstick", f"axes{x}")
+        sticks.append({"id": group,
+                       "label": {"lstick": "Left stick", "rstick": "Right stick"}.get(
+                           group, f"Stick (axes {x + 1} + {y + 1})"),
+                       "dirs": {"up": [f"axis {y} 0"], "down": [f"axis {y} 1"],
+                                "left": [f"axis {x} 0"], "right": [f"axis {x} 1"]}})
+    if len(stick_axes) % 2:
+        axis = stick_axes[-1]
+        pressables.append({"id": f"axis{axis}", "label": f"Axis {axis + 1}",
+                           "binds": [f"axis {axis} 1"]})
+    for axis in triggers:
+        pressables.append({"id": f"axis{axis}", "label": f"Trigger (axis {axis + 1})",
+                           "binds": [f"axis {axis} {int(rest[axis] < 0)}"]})
+    pressables += [{"id": f"button{b}", "label": f"Button {b + 1}", "binds": [f"button {b}"]}
+                   for b in range(min(buttons, 36)) if f"b{b}" not in used]
+
+    order = {"dpad": 0, "lstick": 1, "rstick": 2}
+    return sorted(sticks, key=lambda c: order.get(c["id"], 3)) + pressables
+
+
+def generic_pad_controls() -> list:
+    """The controls to go by before AutoDOS has seen the controller: a D-pad,
+    two sticks and 12 buttons, numbered as most controllers number them."""
+    return pad_controls("", 12, 4, 1, [0] * 4)
+
+
+# The controller the Gamepad window saw last. Games use it to know which
+# button is which; each game's own setup only says what each control does.
+PAD_FILE = CONTROLLER_MAPS_DIR / "controller.json"
+
+
+def _valid_control(control) -> bool:
+    """A control read from a file: only inputs DOSBox's mapper understands."""
+    def inputs_ok(inputs):
+        return isinstance(inputs, list) and all(
+            isinstance(i, str) and PAD_INPUT.fullmatch(i) for i in inputs)
+    if not isinstance(control, dict) or not isinstance(control.get("id"), str):
+        return False
+    if "dirs" in control:
+        dirs = control["dirs"]
+        return (isinstance(dirs, dict) and set(dirs) <= set(PAD_DIRECTIONS)
+                and all(inputs_ok(v) for v in dirs.values()))
+    return inputs_ok(control.get("binds"))
+
+
+def remembered_pad() -> dict | None:
+    """The controller the Gamepad window saw last: {"name", "controls"}."""
+    try:
+        pad = json.loads(PAD_FILE.read_text(encoding="utf-8"))
+        controls = [dict(c, label=str(c.get("label") or c["id"]))
+                    for c in pad["controls"] if _valid_control(c)]
+        name = str(pad.get("name") or "")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return {"name": name, "controls": controls} if controls else None
+
+
+def remember_pad(name: str, controls: list) -> None:
+    try:
+        CONTROLLER_MAPS_DIR.mkdir(exist_ok=True)
+        PAD_FILE.write_text(json.dumps({"name": name, "controls": controls}, indent=1),
+                            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def saved_pad_actions(entry: dict) -> dict:
+    """The control -> action choices saved for a game ({} if none)."""
     saved = entry.get("gamepad")
-    if isinstance(saved, dict):
-        settings.update({k: v for k, v in saved.items() if k in settings})
-    return settings
+    actions = saved.get("actions") if isinstance(saved, dict) else None
+    return dict(actions) if isinstance(actions, dict) else {}
 
 
-def gamepad_mapper(settings: dict) -> tuple:
-    """A complete DOSBox mapper file for a game's pad settings, and whether
-    the game should see the pad as a joystick: (file text, uses_joystick)."""
+def pad_action(saved: dict, control_id: str) -> str:
+    """What a control does in a game: what was saved, else the Joystick preset."""
+    return saved.get(control_id, PAD_PRESETS["Joystick"].get(control_id, "none"))
+
+
+def gamepad_mapper(controls: list, actions: dict) -> tuple:
+    """A complete DOSBox mapper file for a game's controller setup, and
+    whether the game should see a joystick: (file text, uses_joystick)."""
     binds, order = {}, []
     for line in DOSBOX_DEFAULT_BINDS.splitlines():
         event = line.split(None, 1)[0]
         binds[event] = re.findall(r'"([^"]*)"', line)
         order.append(event)
 
-    # DOSBox's default joystick bindings (it only adds these itself when no
-    # mapper file is loaded), plus the D-pad's hat moving the stick
-    joy = {}
-    for n in range(6):
-        joy[f"jbutton_0_{n}"] = [f"stick_0 button {n}"]
-    for n in range(2):
-        joy[f"jbutton_1_{n}"] = [f"stick_1 button {n}"]
-    for axis in range(4):
-        joy[f"jaxis_0_{axis}-"] = [f"stick_0 axis {axis} 0"]
-        joy[f"jaxis_0_{axis}+"] = [f"stick_0 axis {axis} 1"]
-    for axis in range(2):
-        joy[f"jaxis_1_{axis}-"] = [f"stick_1 axis {axis} 0"]
-        joy[f"jaxis_1_{axis}+"] = [f"stick_1 axis {axis} 1"]
-    for n, hat in enumerate((1, 2, 4, 8)):
-        joy[f"jhat_0_0_{n}"] = [f"stick_0 hat 0 {hat}"]
-    joy["jaxis_0_1-"].append("stick_0 hat 0 1")
-    joy["jaxis_0_1+"].append("stick_0 hat 0 4")
-    joy["jaxis_0_0-"].append("stick_0 hat 0 8")
-    joy["jaxis_0_0+"].append("stick_0 hat 0 2")
-
-    def take_from_joystick(pad_binds):
-        for event in joy:
-            joy[event] = [b for b in joy[event] if b not in pad_binds]
-
-    def add(event, pad_binds):
+    def add(event, inputs):
         if event not in binds:
             binds[event] = []
             order.append(event)
-        binds[event].extend(pad_binds)
+        # DOSBox calls the first two controllers it finds stick_0 and stick_1:
+        # binding both lets either one play
+        binds[event] += [f"stick_{n} {i}" for n in (0, 1) for i in inputs]
 
-    dpad = settings.get("dpad", "joystick")
-    uses_joystick = dpad == "joystick"
-    if not uses_joystick:
-        take_from_joystick({b for pair in PAD_DPAD.values() for b in pair})
-        for direction, event in PAD_DPAD_KEYS.get(dpad, {}).items():
-            add(event, list(PAD_DPAD[direction]))
-
-    for control, _label, numbers in PAD_BUTTONS:
-        choice = settings.get(control, "none")
-        if choice == "joystick" and control in PAD_JOYSTICK_BUTTONS:
+    uses_joystick = False
+    for control in controls:
+        action = actions.get(control["id"], "none")
+        if "dirs" in control:
+            events = PAD_DIR_EVENTS.get(action, {})
+            for direction, inputs in control["dirs"].items():
+                for event in events.get(direction, ()):
+                    add(event, inputs)
+        else:
+            events = PAD_JOY_EVENTS.get(action) or (
+                [action] if action in PAD_KEY_EVENTS else [])
+            for event in events:
+                add(event, control["binds"])
+        if events and action in PAD_JOYSTICK_ACTIONS:
             uses_joystick = True
-            continue
-        pad_binds = [f"stick_0 button {n}" for n in numbers]
-        take_from_joystick(set(pad_binds))
-        if choice != "none" and choice != "joystick":
-            add(choice, pad_binds)
 
     lines = [event + "".join(f' "{b}"' for b in binds[event]) for event in order]
-    lines += [event + "".join(f' "{b}"' for b in joy[event]) for event in joy]
     return "\n".join(lines) + "\n", uses_joystick
 
+
 def write_gamepad_mapper(entry: dict) -> tuple:
-    """Write a game's DOSBox mapper file: (path, uses_joystick)."""
-    text, uses_joystick = gamepad_mapper(gamepad_settings(entry))
+    """Write a game's DOSBox mapper file, for the controller the Gamepad
+    window saw last (or a typical one): (path, uses_joystick)."""
+    pad = remembered_pad()
+    controls = pad["controls"] if pad else generic_pad_controls()
+    saved = saved_pad_actions(entry)
+    text, uses_joystick = gamepad_mapper(
+        controls, {c["id"]: pad_action(saved, c["id"]) for c in controls})
     CONTROLLER_MAPS_DIR.mkdir(exist_ok=True)
     safe = re.sub(r'[<>:"/\\|?*\s]+', "_", str(entry.get("id") or "game")).strip("._") or "game"
     path = CONTROLLER_MAPS_DIR / (safe + ".map")
@@ -788,85 +1079,140 @@ def write_gamepad_mapper(entry: dict) -> tuple:
     return path, uses_joystick
 
 
-# ── Reading the pad live (for the Gamepad window's button test) ───────────────
-# Uses the Windows joystick API, which sees DirectInput pads like the
-# SideWinder (XInput only sees Xbox-style pads). Buttons count from 0 here,
-# in the same order DOSBox numbers them.
+# ── Reading controllers (for the Gamepad window) ─────────────────────────────
 
-class _JOYINFOEX(ctypes.Structure):
-    _fields_ = [(name, ctypes.c_uint32) for name in (
-        "dwSize", "dwFlags", "dwXpos", "dwYpos", "dwZpos", "dwRpos", "dwUpos",
-        "dwVpos", "dwButtons", "dwButtonNumber", "dwPOV", "dwReserved1", "dwReserved2")]
+class _SDLGUID(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_uint8 * 16)]
 
 
-class _JOYCAPSW(ctypes.Structure):
-    _fields_ = ([("wMid", ctypes.c_uint16), ("wPid", ctypes.c_uint16),
-                 ("szPname", ctypes.c_wchar * 32)]
-                + [(name, ctypes.c_uint32) for name in (
-                    "wXmin", "wXmax", "wYmin", "wYmax", "wZmin", "wZmax",
-                    "wNumButtons", "wPeriodMin", "wPeriodMax", "wRmin", "wRmax",
-                    "wUmin", "wUmax", "wVmin", "wVmax", "wCaps", "wMaxAxes",
-                    "wNumAxes", "wMaxButtons")]
-                + [("szRegKey", ctypes.c_wchar * 32), ("szOEMVxD", ctypes.c_wchar * 260)])
+_SDL_FUNCTIONS = {
+    "SDL_InitSubSystem":       (ctypes.c_int, [ctypes.c_uint32]),
+    "SDL_Quit":                (None, []),
+    "SDL_GetError":            (ctypes.c_char_p, []),
+    "SDL_NumJoysticks":        (ctypes.c_int, []),
+    "SDL_JoystickUpdate":      (None, []),
+    "SDL_JoystickNameForIndex":        (ctypes.c_char_p, [ctypes.c_int]),
+    "SDL_JoystickGetDeviceGUID":       (_SDLGUID, [ctypes.c_int]),
+    "SDL_JoystickGetDeviceInstanceID": (ctypes.c_int32, [ctypes.c_int]),
+    "SDL_JoystickOpen":        (ctypes.c_void_p, [ctypes.c_int]),
+    "SDL_JoystickClose":       (None, [ctypes.c_void_p]),
+    "SDL_JoystickGetAttached": (ctypes.c_int, [ctypes.c_void_p]),
+    "SDL_JoystickNumAxes":     (ctypes.c_int, [ctypes.c_void_p]),
+    "SDL_JoystickNumButtons":  (ctypes.c_int, [ctypes.c_void_p]),
+    "SDL_JoystickNumHats":     (ctypes.c_int, [ctypes.c_void_p]),
+    "SDL_JoystickGetAxis":     (ctypes.c_int16, [ctypes.c_void_p, ctypes.c_int]),
+    "SDL_JoystickGetButton":   (ctypes.c_uint8, [ctypes.c_void_p, ctypes.c_int]),
+    "SDL_JoystickGetHat":      (ctypes.c_uint8, [ctypes.c_void_p, ctypes.c_int]),
+    "SDL_GameControllerMappingForDeviceIndex": (ctypes.c_void_p, [ctypes.c_int]),
+    "SDL_GameControllerTypeForIndex":          (ctypes.c_int, [ctypes.c_int]),
+    "SDL_free":                (None, [ctypes.c_void_p]),
+}
+_SDL_INIT_GAMECONTROLLER = 0x2000   # starts SDL's joystick support too
 
 
-def _winmm():
-    try:
-        return ctypes.windll.winmm
-    except (AttributeError, OSError):
+def dosbox_sdl(dosbox) -> Path | None:
+    """DOSBox's SDL2.dll, in the folder dosbox.exe is in."""
+    if not dosbox:
         return None
+    exe = shutil.which(dosbox[0]) or dosbox[0]
+    dll = Path(exe).resolve().parent / "SDL2.dll"
+    return dll if dll.is_file() else None
 
 
-def find_gamepad():
-    """The first connected game controller as (id, name, x range, y range),
-    or None."""
-    winmm = _winmm()
-    if not winmm:
-        return None
-    info = _JOYINFOEX(dwSize=ctypes.sizeof(_JOYINFOEX), dwFlags=0xFF)
-    for joy_id in range(16):
-        if winmm.joyGetPosEx(joy_id, ctypes.byref(info)) != 0:
-            continue
-        caps = _JOYCAPSW()
-        if winmm.joyGetDevCapsW(joy_id, ctypes.byref(caps), ctypes.sizeof(caps)) != 0:
-            caps.wXmax = caps.wYmax = 65535
-        if caps.wMid == 0x045E and caps.wPid in (0x0007, 0x0027):
-            name = "SideWinder Game Pad"
-        else:
-            name = "Gamepad"
-        return (joy_id, name, (caps.wXmin, caps.wXmax or 65535),
-                (caps.wYmin, caps.wYmax or 65535))
-    return None
+class Controllers:
+    """The connected game controllers, read through DOSBox's own SDL2.dll so
+    their buttons are numbered as DOSBox numbers them. Tk thread only: SDL
+    gets its Windows messages through Tk's message loop."""
+
+    def __init__(self, dll: Path):
+        sdl = ctypes.CDLL(str(dll))
+        for name, (restype, argtypes) in _SDL_FUNCTIONS.items():
+            function = getattr(sdl, name)
+            function.restype, function.argtypes = restype, argtypes
+        if sdl.SDL_InitSubSystem(_SDL_INIT_GAMECONTROLLER) != 0:
+            error = (sdl.SDL_GetError() or b"").decode("utf-8", "replace")
+            sdl.SDL_Quit()
+            raise OSError(error or "SDL couldn't start")
+        self.sdl   = sdl
+        self.stick = None
+
+    def connected(self) -> list:
+        """[(SDL instance id, name)] of the connected controllers, in the
+        order DOSBox numbers them."""
+        sdl = self.sdl
+        sdl.SDL_JoystickUpdate()      # also picks up controllers coming and going
+        pads = []
+        for index in range(sdl.SDL_NumJoysticks()):
+            name = (sdl.SDL_JoystickNameForIndex(index) or b"").decode("utf-8", "replace")
+            # SDL's id for the controller says which Windows API reads it
+            # (Xbox controllers it reads directly are XInput ones too)
+            api = chr(sdl.SDL_JoystickGetDeviceGUID(index).data[14])
+            xbox = sdl.SDL_GameControllerTypeForIndex(index) in (1, 2)
+            kind = "XInput" if api in "xrw" or xbox else "DirectInput"
+            pads.append((sdl.SDL_JoystickGetDeviceInstanceID(index),
+                         f"{name or 'Controller'} ({kind})"))
+        return pads
+
+    def open(self, instance_id: int) -> list | None:
+        """Start reading a controller from connected(): its controls, or
+        None if it's gone."""
+        self.close()
+        sdl = self.sdl
+        index = next((i for i in range(sdl.SDL_NumJoysticks())
+                      if sdl.SDL_JoystickGetDeviceInstanceID(i) == instance_id), None)
+        stick = sdl.SDL_JoystickOpen(index) if index is not None else None
+        if not stick:
+            return None
+        self.stick = stick
+        mapping, text = sdl.SDL_GameControllerMappingForDeviceIndex(index), ""
+        if mapping:
+            text = ctypes.string_at(mapping).decode("utf-8", "replace")
+            sdl.SDL_free(mapping)
+        axes = max(sdl.SDL_JoystickNumAxes(stick), 0)
+        return pad_controls(text, max(sdl.SDL_JoystickNumButtons(stick), 0), axes,
+                            max(sdl.SDL_JoystickNumHats(stick), 0),
+                            [sdl.SDL_JoystickGetAxis(stick, a) for a in range(axes)],
+                            sdl.SDL_GameControllerTypeForIndex(index))
+
+    def read(self) -> tuple | None:
+        """(buttons, axes, hat) of the open controller, None once it's gone."""
+        sdl, stick = self.sdl, self.stick
+        if not stick:
+            return None
+        sdl.SDL_JoystickUpdate()
+        if not sdl.SDL_JoystickGetAttached(stick):
+            self.close()
+            return None
+        return ([sdl.SDL_JoystickGetButton(stick, b)
+                 for b in range(sdl.SDL_JoystickNumButtons(stick))],
+                [sdl.SDL_JoystickGetAxis(stick, a)
+                 for a in range(sdl.SDL_JoystickNumAxes(stick))],
+                sdl.SDL_JoystickGetHat(stick, 0) if sdl.SDL_JoystickNumHats(stick) > 0 else 0)
+
+    def close(self):
+        if self.stick:
+            self.sdl.SDL_JoystickClose(self.stick)
+            self.stick = None
+
+    def quit(self):
+        """Let go of the controllers: DOSBox needs DirectInput ones to itself."""
+        self.close()
+        self.sdl.SDL_Quit()
 
 
-def read_gamepad(pad) -> tuple | None:
-    """(pressed button numbers, pressed D-pad directions) for a pad from
-    find_gamepad(), or None if it's been unplugged."""
-    winmm = _winmm()
-    joy_id, _name, (xmin, xmax), (ymin, ymax) = pad
-    info = _JOYINFOEX(dwSize=ctypes.sizeof(_JOYINFOEX), dwFlags=0xFF)   # JOY_RETURNALL
-    if not winmm or winmm.joyGetPosEx(joy_id, ctypes.byref(info)) != 0:
-        return None
-    buttons = {n for n in range(32) if info.dwButtons >> n & 1}
-    dirs = set()
-    for pos, low, high, neg, plus in ((info.dwXpos, xmin, xmax, "left", "right"),
-                                      (info.dwYpos, ymin, ymax, "up", "down")):
-        span = max(high - low, 1)
-        if pos < low + span // 4:
-            dirs.add(neg)
-        elif pos > high - span // 4:
-            dirs.add(plus)
-    if info.dwPOV != 0xFFFF:                     # hat, in hundredths of a degree
-        angle = info.dwPOV / 100
-        if angle >= 292.5 or angle <= 67.5:
-            dirs.add("up")
-        if 22.5 <= angle <= 157.5:
-            dirs.add("right")
-        if 112.5 <= angle <= 247.5:
-            dirs.add("down")
-        if 202.5 <= angle <= 337.5:
-            dirs.add("left")
-    return buttons, dirs
+def pad_input_pressed(name: str, state: tuple, threshold: int = 25000) -> bool:
+    """Whether an input ('button 3', 'axis 1 0', 'hat 0 4') is pressed in a
+    Controllers.read() state. Axes count past DOSBox's own threshold."""
+    buttons, axes, hat = state
+    kind, *n = name.split()
+    if kind == "button":
+        return int(n[0]) < len(buttons) and bool(buttons[int(n[0])])
+    if kind == "hat":
+        return bool(hat & int(n[1]))
+    axis = int(n[0])
+    if axis >= len(axes):
+        return False
+    return axes[axis] > threshold if n[1] == "1" else axes[axis] < -threshold
 
 
 def dark_title_bar(window) -> None:
@@ -1076,9 +1422,21 @@ class App:
                    style="Pill.TButton",
                    command=self._add_archive).pack(side=tk.LEFT, padx=(0, 6))
 
+        ttk.Button(bar, text="💿  Add CD",
+                   style="Pill.TButton",
+                   command=self._add_cd).pack(side=tk.LEFT, padx=(0, 6))
+
         ttk.Button(bar, text="🗑  Remove",
                    style="Pill.TButton",
                    command=self._remove_selected).pack(side=tk.RIGHT)
+
+        # Widen the window if the buttons need it (large fonts or display
+        # scaling would otherwise cut off Remove)
+        bar.update_idletasks()
+        need = bar.winfo_reqwidth() + 2 * 14
+        if need > 520:
+            self.root.geometry(f"{need}x700")
+            self.root.minsize(need, 600)
 
     # ── Library ───────────────────────────────────────────────────────────
 
@@ -1313,11 +1671,12 @@ class App:
             folder, n = GAMES_DIR / f"{name} ({n})", n + 1
         return folder
 
-    def _add_to_library(self, entry: dict):
-        """Add a newly imported game. Importing the same archive again replaces
-        its old entry, keeping the name and gamepad setup set for it, and
-        ids stay unique so renames and settings reach the right game."""
-        old = [e for e in self.library if e.get("archive_name") == entry["archive_name"]]
+    def _add_to_library(self, entry: dict, same: str = "archive_name"):
+        """Add a newly imported game. Importing the same archive (for Add CD,
+        the same folder) again replaces its old entry, keeping the name and
+        gamepad setup set for it, and ids stay unique so renames and settings
+        reach the right game."""
+        old = [e for e in self.library if e.get(same) == entry[same]]
         if old:
             entry["name"] = old[0].get("name") or entry["name"]
             if old[0].get("gamepad"):
@@ -1342,6 +1701,110 @@ class App:
         RenameModal(self.root, entry, on_save=self._on_rename_saved,
                     then=lambda: self._launch_entry(entry))
 
+    # ── CD Add Pipeline ───────────────────────────────────────────────────────
+
+    def _add_cd(self):
+        """Pick a pre-extracted game folder — scan for ISOs and exe on disc."""
+        folder = filedialog.askdirectory(
+            title="Select game folder",
+            parent=self.root,
+        )
+        if not folder:
+            return
+        dest = Path(folder)
+        stem = dest.name
+        if any(e["extracted_path"] == str(dest) for e in self.library):
+            if not messagebox.askyesno("Duplicate",
+                    "'" + stem + "' is already in your library. Re-import it?",
+                    parent=self.root):
+                return
+        threading.Thread(
+            target=self._ingest_cd_thread,
+            args=(dest, stem),
+            daemon=True,
+        ).start()
+
+    def _ingest_cd_thread(self, dest: Path, stem: str):
+        """Worker: find ISOs, scan first ISO for exe candidates, show picker."""
+        display_name = stem.replace("-", " ").replace("_", " ").title()
+        try:
+            exo     = lookup_exodos(display_name)
+            cd_isos = detect_cd_source(dest)
+        except OSError as e:
+            self._show_error_later("Add CD Failed", str(e))
+            return
+
+        if not cd_isos:
+            self._show_error_later(
+                "No Disc Images Found",
+                "No ISO, BIN, CUE, or IMG files found in that folder.")
+            return
+
+        # Build base entry with ExoDOS settings if matched
+        entry = {
+            "id":             stem,
+            "name":           exo["title"] if exo and "title" in exo else display_name,
+            "archive_name":   stem,
+            "extracted_path": str(dest),
+            "exe_path":       "",
+            "date_added":     str(date.today()),
+            "cycles":         str(exo.get("cycles") or "auto") if exo else "auto",
+            "memsize":        snap_memsize(int(exo["memsize"])) if exo and exo.get("memsize") else 16,
+            "xms":            bool(exo.get("xms", True)) if exo else True,
+            "ems":            bool(exo.get("ems", True)) if exo else True,
+            "cd_isos":        cd_isos,
+            "cd_mount":       True,
+            "cd_exe":         str(exo.get("exe", "")) if exo else "",
+        }
+
+        # No ExoDOS exe — scan the first disc's data track for candidates
+        # (every program on it if all of them look like installers or tools)
+        exe_candidates = []
+        if not entry["cd_exe"]:
+            data_track = disc_data_file(cd_isos[0])
+            exe_candidates = (scan_iso_for_exes(data_track)
+                              or scan_iso_for_exes(data_track, skip_blacklisted=False))
+            if not exe_candidates:
+                self._show_error_later(
+                    "No Exe Found in Disc",
+                    "Could not detect a game executable inside the disc image.")
+                return
+
+        def finish():
+            self._add_to_library(entry, same="extracted_path")
+            if entry["cd_exe"]:
+                # ExoDOS gave us the exe, use it directly
+                self._show_disc_tip(entry)
+                self._launch_entry(entry)
+            else:
+                # Show ISO exe picker so user selects which exe to run
+                IsoExePickerModal(self.root, exe_candidates, entry,
+                                  on_confirm=self._on_iso_exe_picked)
+        self.root.after(0, finish)
+
+    def _on_iso_exe_picked(self, entry: dict, cd_exe: str):
+        """Called when user picks an exe from the ISO picker."""
+        entry["cd_exe"] = cd_exe
+        for i, e in enumerate(self.library):
+            if e["id"] == entry["id"]:
+                self.library[i] = entry
+                break
+        self._save_library()
+        self._show_disc_tip(entry)
+        RenameModal(self.root, entry, on_save=self._on_rename_saved,
+                    then=lambda: self._launch_entry(entry))
+
+    def _show_disc_tip(self, entry: dict):
+        """Show multi-disc tip if game has more than one ISO."""
+        cd_isos = entry.get("cd_isos", [])
+        if len(cd_isos) > 1:
+            names = "\n".join("  Disc " + str(i+1) + ": " + Path(cd_isos[i]).name
+                               for i in range(len(cd_isos)))
+            msg = (entry["name"] + " has " + str(len(cd_isos)) + " discs:\n" +
+                   names + "\n\nDisc 1 will be mounted as D: on launch.\n"
+                   "Press Ctrl+F4 in DOSBox to swap discs.")
+            messagebox.showinfo("Multi-Disc Game", msg, parent=self.root)
+
     # ── Launch ────────────────────────────────────────────────────────────
 
     def _launch_selected(self):
@@ -1355,8 +1818,7 @@ class App:
         """Launch a game entry via DOSBox.
 
         Case 1 — SIMPLE: exe on C:, optional ISO on D:
-        Case 2 — CD_ONLY (games added with the old Add CD button): imgmount
-                 all ISOs as D:, boot from D:, run cd_exe
+        Case 2 — CD_ONLY: imgmount all ISOs as D:, boot from D:, run cd_exe
         """
         if not self.dosbox:
             messagebox.showerror(
@@ -1410,17 +1872,23 @@ class App:
                 messagebox.showwarning(
                     "No Disc Exe Set",
                     "No executable set for this CD game.\n"
-                    "Remove it and add the game's 7z instead.",
+                    "Remove and re-add via Add CD to scan the disc.",
                     parent=self.root)
                 return
             c_path  = str(extracted)
             mount_c = f'mount c "{c_path}"' if " " in c_path else f"mount c {c_path}"
-            run_cmd = f'"{cd_exe}"' if " " in cd_exe else cd_exe
+            # The exe can be in a folder on the disc (e.g. GAME\PLAY.EXE)
+            exe_folder, _, exe_name = cd_exe.replace("/", "\\").rpartition("\\")
+            run_cmd = f'"{exe_name}"' if " " in exe_name else exe_name
             cmd = [binary] + prefix + base_args
             cmd += [
                 "-c", mount_c,
                 "-c", make_imgmount(cd_isos),
                 "-c", "D:",
+            ]
+            if exe_folder:
+                cmd += ["-c", f'cd "\\{exe_folder}"' if " " in exe_folder else f"cd \\{exe_folder}"]
+            cmd += [
                 "-c", run_cmd,
                 "-c", "exit",
             ]
@@ -1505,7 +1973,7 @@ class App:
 
     def _show_gamepad(self, entry: dict):
         """Open the gamepad setup for a game from the context menu."""
-        GamepadModal(self.root, entry, on_save=self._on_gamepad_saved)
+        GamepadModal(self.root, entry, self.dosbox, on_save=self._on_gamepad_saved)
 
     def _on_gamepad_saved(self, entry: dict, settings: dict):
         """Save a game's gamepad setup to the library."""
@@ -1887,23 +2355,96 @@ class RenameModal:
             self.then()
 
 
+# ── ISO Exe Picker Modal ─────────────────────────────────────────────────────
+
+class IsoExePickerModal:
+    """Pick which exe inside the ISO to launch the game with."""
+
+    def __init__(self, parent, exe_candidates: list, entry: dict, on_confirm):
+        self.exe_candidates = exe_candidates
+        self.entry          = entry
+        self.on_confirm     = on_confirm
+
+        self.win = tk.Toplevel(parent)
+        self.win.title("Select Game Executable")
+        self.win.configure(bg=BG)
+        self.win.geometry("420x300")
+        self.win.resizable(False, False)
+        self.win.transient(parent)
+        self.win.lift()
+        self.win.focus_force()
+        dark_title_bar(self.win)
+
+        tk.Label(self.win,
+                 text="Executables found on disc — select the one that runs the game:",
+                 bg=BG, fg=TEXT, font=("TkDefaultFont", 11),
+                 wraplength=380, justify=tk.LEFT
+                 ).pack(anchor="w", padx=16, pady=(16, 8))
+
+        frame = tk.Frame(self.win, bg=BORDER, bd=1)
+        frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
+
+        self.lb = tk.Listbox(
+            frame, bg=LIST_BG, fg=TEXT,
+            selectbackground=SEL_BG, selectforeground=TEXT,
+            activestyle="none", relief="flat", bd=0,
+            font=("TkDefaultFont", 12), highlightthickness=0,
+            exportselection=False, height=6)   # short enough for the buttons to fit
+        self.lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=1, pady=1)
+        self.lb.bind("<Double-Button-1>", lambda e: self._confirm())
+        self.lb.bind("<Return>",          lambda e: self._confirm())
+
+        sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.lb.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.lb.configure(yscrollcommand=sb.set)
+
+        for name in exe_candidates:
+            self.lb.insert(tk.END, f"  {name}")
+        self.lb.selection_set(0)
+        self.lb.focus_set()
+
+        btn_frame = tk.Frame(self.win, bg=BG)
+        btn_frame.pack(fill=tk.X, padx=16, pady=(0, 14))
+
+        ttk.Button(btn_frame, text="▶  Launch", style="Pill.TButton",
+                   command=self._confirm).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_frame, text="Cancel", style="Pill.TButton",
+                   command=self.win.destroy).pack(side=tk.LEFT)
+
+    def _confirm(self):
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        chosen = self.exe_candidates[sel[0]]
+        self.win.destroy()
+        self.on_confirm(self.entry, chosen)
+
+
 # ── Gamepad Modal ────────────────────────────────────────────────────────────
 
 class GamepadModal:
-    """Per-game setup for a Microsoft SideWinder Game Pad: what the D-pad and
-    each button do in the game, with a live test of the pad's buttons."""
+    """Per-game controller setup: what each control on a DirectInput or XInput
+    controller does in the game, with a live test of the controller."""
 
-    def __init__(self, parent, entry: dict, on_save):
+    def __init__(self, parent, entry: dict, dosbox, on_save):
         self.entry     = entry
+        self.dosbox    = dosbox
         self.on_save   = on_save
-        self.pad       = None
-        self.next_scan = 0.0
+        self.saved     = saved_pad_actions(entry)
+        self.choices   = {}      # control id -> action picked in this window
+        self.pads      = None    # Controllers, once SDL has started
+        self.connected = []      # [(SDL instance id, name)]
+        self.current   = None    # instance id of the controller being read
+        self.lost      = False   # the controller being read went away
+        self.rows      = {}      # control id -> (light, StringVar, control)
+        self.lit       = {}      # control id -> what its light shows now
+        self.ticks     = 0
         self.after_id  = None
 
         self.win = tk.Toplevel(parent)
         self.win.title("Gamepad — " + entry["name"])
         self.win.configure(bg=BG)
-        self.win.geometry("460x610")
+        self.win.geometry("480x660")
         self.win.resizable(False, False)
         self.win.transient(parent)
         self.win.lift()
@@ -1911,14 +2452,21 @@ class GamepadModal:
         dark_title_bar(self.win)
         self.win.protocol("WM_DELETE_WINDOW", self._close)
 
-        tk.Label(self.win, text="Microsoft SideWinder Game Pad",
-                 bg=BG, fg=TEXT, font=("TkDefaultFont", 11, "bold")
-                 ).pack(anchor="w", padx=16, pady=(14, 0))
+        self.heading = tk.Label(self.win, text="Looking for controllers…",
+                                bg=BG, fg=TEXT, font=("TkDefaultFont", 11, "bold"),
+                                anchor="w")
+        self.heading.pack(fill=tk.X, padx=16, pady=(14, 0))
+        # Shown when more than one controller is connected
+        self.pad_var = tk.StringVar()
+        self.pad_box = ttk.Combobox(self.win, textvariable=self.pad_var,
+                                    state="readonly", font=("TkDefaultFont", 10))
+        self.pad_box.bind("<<ComboboxSelected>>", self._on_pick)
         tk.Label(self.win,
-                 text="Joystick: games with joystick support use the pad as a "
-                      "PC joystick.\nPick keys for games that only use the keyboard.",
-                 bg=BG, fg=MUTED, font=("TkDefaultFont", 9), justify=tk.LEFT
-                 ).pack(anchor="w", padx=16, pady=(2, 10))
+                 text="Press a button on the controller and its row lights up. "
+                      "Joystick works in games with joystick support; pick keys "
+                      "for games that only use the keyboard.",
+                 bg=BG, fg=MUTED, font=("TkDefaultFont", 9), justify=tk.LEFT,
+                 wraplength=440).pack(anchor="w", padx=16, pady=(2, 10))
 
         presets = tk.Frame(self.win, bg=BG)
         presets.pack(fill=tk.X, padx=16, pady=(0, 10))
@@ -1929,30 +2477,25 @@ class GamepadModal:
                        command=lambda n=name: self._apply(PAD_PRESETS[n])
                        ).pack(side=tk.LEFT, padx=(0, 6))
 
-        table = tk.Frame(self.win, bg=BORDER)
-        table.pack(fill=tk.X, padx=16)
-        self.lights, self.vars = {}, {}
-        settings = gamepad_settings(entry)
-        rows = [("dpad", "D-pad")] + [(c, label) for c, label, _ in PAD_BUTTONS]
-        for i, (control, label) in enumerate(rows):
-            bg = LIST_BG if i % 2 == 0 else ALT_ROW_BG
-            row = tk.Frame(table, bg=bg)
-            row.pack(fill=tk.X, padx=1, pady=(1 if i == 0 else 0, 1))
-            light = tk.Label(row, text="●", bg=bg, fg=BORDER,
-                             font=("TkDefaultFont", 11))
-            light.pack(side=tk.LEFT, padx=(10, 6))
-            tk.Label(row, text=label, bg=bg, fg=TEXT, font=("TkDefaultFont", 11),
-                     width=10, anchor="w").pack(side=tk.LEFT, pady=5)
-            var = tk.StringVar(value=self._name(control, settings[control]))
-            ttk.Combobox(row, textvariable=var, state="readonly", width=24, height=14,
-                         values=[name for _, name in self._choices(control)],
-                         font=("TkDefaultFont", 10)
-                         ).pack(side=tk.RIGHT, padx=8, pady=4)
-            self.lights[control], self.vars[control] = light, var
+        # The controls, in a table that scrolls
+        frame = tk.Frame(self.win, bg=BORDER)
+        frame.pack(fill=tk.BOTH, expand=True, padx=16)
+        self.canvas = tk.Canvas(frame, bg=LIST_BG, highlightthickness=0, bd=0)
+        bar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 1), pady=1)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(1, 0), pady=1)
+        self.table = tk.Frame(self.canvas, bg=LIST_BG)
+        table_id = self.canvas.create_window(0, 0, window=self.table, anchor="nw")
+        self.table.bind("<Configure>", lambda e: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(
+            table_id, width=e.width))
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
 
         self.status = tk.Label(self.win, text="", bg=BG, fg=MUTED,
                                font=("TkDefaultFont", 9), justify=tk.LEFT,
-                               wraplength=420)
+                               wraplength=440)
         self.status.pack(anchor="w", padx=16, pady=(10, 0))
 
         buttons = tk.Frame(self.win, bg=BG)
@@ -1962,60 +2505,196 @@ class GamepadModal:
         ttk.Button(buttons, text="Cancel", style="Pill.TButton",
                    command=self._close).pack(side=tk.LEFT)
 
-        self._poll()
+        # Until a controller turns up: the one seen last, or a typical one
+        self.last = remembered_pad()
+        self._show(self.last["controls"] if self.last else generic_pad_controls())
+        # Starting SDL can take a moment, so the window goes up first
+        self.after_id = self.win.after(100, self._start)
+
+    # ── Rows ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _choices(control: str) -> list:
-        """(setting, name shown) choices for one pad control."""
-        if control == "dpad":
-            return PAD_DPAD_CHOICES
-        choices = []
-        if control in PAD_JOYSTICK_BUTTONS:
-            choices.append(("joystick", f"Joystick button {PAD_JOYSTICK_BUTTONS[control]}"))
-        choices.append(("none", "Not used"))
-        return choices + [(event, name) for name, event in PAD_KEYS]
+    def _choices(control: dict) -> list:
+        """(action, name shown) choices for one control."""
+        if "dirs" in control:
+            return PAD_DIR_CHOICES
+        return (PAD_JOY_BUTTONS + [("none", "Not used")]
+                + [(event, name) for name, event in PAD_KEYS])
 
-    def _name(self, control: str, value: str) -> str:
-        names = dict(self._choices(control))
-        return names.get(value, "Not used")
+    def _name(self, control: dict, action: str) -> str:
+        return dict(self._choices(control)).get(action, "Not used")
 
-    def _apply(self, settings: dict):
-        for control, var in self.vars.items():
-            var.set(self._name(control, settings.get(control, "none")))
+    def _action(self, control_id: str) -> str:
+        if control_id in self.choices:
+            return self.choices[control_id]
+        return pad_action(self.saved, control_id)
+
+    def _show(self, controls: list):
+        """Fill the table with a controller's controls."""
+        for child in self.table.winfo_children():
+            child.destroy()
+        self.rows, self.lit = {}, {}
+        for i, control in enumerate(controls):
+            bg = LIST_BG if i % 2 == 0 else ALT_ROW_BG
+            row = tk.Frame(self.table, bg=bg)
+            row.pack(fill=tk.X)
+            light = tk.Label(row, text="●", bg=bg, fg=BORDER, width=3,
+                             font=("TkDefaultFont", 11))
+            light.pack(side=tk.LEFT, padx=(6, 2))
+            label = tk.Label(row, text=control["label"], bg=bg, fg=TEXT,
+                             font=("TkDefaultFont", 11), anchor="w")
+            label.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=5)
+            var = tk.StringVar(value=self._name(control, self._action(control["id"])))
+            box = ttk.Combobox(row, textvariable=var, state="readonly", width=22,
+                               height=14, values=[n for _, n in self._choices(control)],
+                               font=("TkDefaultFont", 10))
+            box.pack(side=tk.RIGHT, padx=8, pady=4)
+            box.bind("<<ComboboxSelected>>",
+                     lambda e, c=control, v=var: self._picked(c, v))
+            for widget in (row, light, label, box):
+                widget.bind("<MouseWheel>", self._on_wheel)
+            self.rows[control["id"]] = (light, var, control)
+        self.canvas.yview_moveto(0)
+
+    def _picked(self, control: dict, var: tk.StringVar):
+        actions = {name: action for action, name in self._choices(control)}
+        self.choices[control["id"]] = actions.get(var.get(), "none")
+
+    def _apply(self, preset: dict):
+        for control_id, (_light, var, control) in self.rows.items():
+            self.choices[control_id] = preset.get(control_id, "none")
+            var.set(self._name(control, self.choices[control_id]))
+
+    def _on_wheel(self, event):
+        """Scroll the table (and not the dropdown under the mouse)."""
+        self.canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1),
+                                 "units")
+        return "break"
+
+    # ── Controllers ───────────────────────────────────────────────────────
+
+    def _start(self):
+        """Start reading controllers through DOSBox's SDL2.dll."""
+        self.after_id = None
+        try:
+            self.win.grab_set()   # no starting games while this holds the controller
+        except tk.TclError:
+            pass
+        dll = dosbox_sdl(self.dosbox)
+        try:
+            if not dll:
+                raise OSError("DOSBox's SDL2.dll wasn't found")
+            self.pads = Controllers(dll)
+        except (OSError, AttributeError) as e:
+            self.heading.config(text="Can't read controllers")
+            self.status.config(text=f"Can't read controllers here ({e}). "
+                                    "You can still set up the buttons below.")
+            return
+        self._poll()
 
     def _poll(self):
-        """Light up the rows of the pad controls being pressed."""
-        now = time.monotonic()
-        if self.pad is None and now >= self.next_scan:
-            self.next_scan = now + 2
-            self.pad = find_gamepad()
-            self.status.config(
-                text=(self.pad[1] + " found. Press its buttons to test them: "
-                      "the matching row lights up.") if self.pad else
-                     "No gamepad found. Plug it in to test its buttons here.")
-        state = read_gamepad(self.pad) if self.pad else None
-        if self.pad and state is None:
-            self.pad = None
-            self.status.config(text="The gamepad was unplugged.")
-        buttons, dirs = state or (set(), set())
-        for control, _label, numbers in PAD_BUTTONS:
-            pressed = any(n in buttons for n in numbers)
-            self.lights[control].config(fg=ACCENT if pressed else BORDER)
-        self.lights["dpad"].config(fg=ACCENT if dirs else BORDER)
+        """Keep up with controllers coming and going, and light up the
+        controls being pressed."""
+        state = self.pads.read() if self.current is not None else None
+        if self.current is not None and state is None:
+            self.current, self.lost = None, True   # switched off, asleep or unplugged
+            self.ticks = 0
+        if self.ticks % (20 if self.current is not None else 10) == 0:
+            self._update_list()
+        self.ticks += 1
+        self._light(state)
         self.after_id = self.win.after(50, self._poll)
 
+    def _update_list(self):
+        connected = self.pads.connected()
+        if connected != self.connected:
+            self.connected = connected
+            self.pad_box.config(values=[name for _, name in connected])
+            if len(connected) > 1:
+                self.pad_box.pack(fill=tk.X, padx=16, pady=(6, 0), after=self.heading)
+            else:
+                self.pad_box.pack_forget()
+            if self.current is not None:
+                self._title()
+        if self.current is None:
+            if connected:
+                self._use(connected[0][0])
+            else:
+                self._none_found()
+
+    def _on_pick(self, _event=None):
+        name = self.pad_var.get()
+        self._use(next((i for i, n in self.connected if n == name), None))
+
+    def _use(self, instance_id):
+        """Read and show one of the connected controllers."""
+        controls = self.pads.open(instance_id) if instance_id is not None else None
+        if controls is None:
+            return
+        name = dict(self.connected).get(instance_id, "Controller")
+        self.current, self.lost = instance_id, False
+        self.pad_var.set(name)
+        self._title()
+        self.status.config(
+            text="Press its buttons to test them: the matching row lights up. "
+                 "Switch it on before you start a game, as DOSBox only looks for "
+                 "controllers when a game starts.")
+        # Games go by the controller seen last to know which button is which
+        remember_pad(name, controls)
+        self._show(controls)
+
+    def _title(self):
+        """Heading: the controller's name, or how many there are to pick from."""
+        if len(self.connected) > 1:
+            self.heading.config(text=f"{len(self.connected)} controllers found. Pick one to set up:")
+        else:
+            self.heading.config(text=dict(self.connected).get(self.current, "Controller"))
+
+    def _none_found(self):
+        self.heading.config(text="No controller found")
+        text = ("The controller was switched off or went to sleep. " if self.lost else "")
+        text += "Switch it on (or plug in its receiver) to test its buttons here."
+        if self.last:
+            text += f" Showing the buttons of {self.last['name'] or 'the controller seen last'}."
+        self.status.config(text=text)
+
+    def _light(self, state):
+        """Light up the rows of the controls being pressed (arrows for a
+        D-pad or stick)."""
+        for control_id, (light, _var, control) in self.rows.items():
+            if state is None:
+                shown = ("●", BORDER)
+            elif "dirs" in control:
+                arrows = "".join(
+                    arrow for direction, arrow in zip(PAD_DIRECTIONS, "↑↓←→")
+                    if any(pad_input_pressed(i, state, 16000)
+                           for i in control["dirs"].get(direction, ())))
+                shown = (arrows, ACCENT) if arrows else ("●", BORDER)
+            else:
+                pressed = any(pad_input_pressed(i, state) for i in control["binds"])
+                shown = ("●", ACCENT if pressed else BORDER)
+            if self.lit.get(control_id) != shown:
+                self.lit[control_id] = shown
+                light.config(text=shown[0], fg=shown[1])
+
+    # ── Save / close ──────────────────────────────────────────────────────
+
     def _save(self):
-        settings = {}
-        for control, var in self.vars.items():
-            values = {name: value for value, name in self._choices(control)}
-            settings[control] = values.get(var.get(), "none")
-        self.on_save(self.entry, settings)
+        actions = dict(self.saved)
+        actions.update({control_id: self._action(control_id) for control_id in self.rows})
+        actions.update(self.choices)
+        self.on_save(self.entry, {"actions": actions})
         self._close()
 
     def _close(self):
         if self.after_id:
             self.win.after_cancel(self.after_id)
+            self.after_id = None
+        if self.pads:
+            self.pads.quit()      # DOSBox needs DirectInput controllers to itself
+            self.pads = None
         self.win.destroy()
+
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
