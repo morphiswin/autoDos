@@ -20,14 +20,17 @@ game, and launches it in DOSBox Staging with the settings eXoDOS recommends.
   cycles format now reach DOSBox.
 - 🔍 **Add CD finds the game.** It reads ISO and BIN discs to find the program
   that starts it.
+- 📝 **One settings file.** Every DOSBox setting lives in `dosbox.conf` next
+  to `AutoDOS.exe`. Edit it and the next game you start uses it. No hidden
+  copies.
 - 🖥️ **Crisp fullscreen.** Direct3D output, sharp pixels and 4:3 aspect,
   tuned for a 1600x1200 screen.
 - 🌙 **Dark theme** everywhere, plus safer imports and plenty of fixes.
 
 ## Using it
 
-1. Put `AutoDOS.exe` next to the `dosbox\` folder (DOSBox Staging 0.82.2) and
-   the `tools\` folder (`7za.exe`).
+1. Put `AutoDOS.exe` next to `dosbox.conf`, the `dosbox\` folder
+   (DOSBox Staging 0.82.2) and the `tools\` folder (`7za.exe`).
 2. Click **Add Zip** and pick a game archive. It unpacks, sets itself up and
    launches.
 3. Double-click a game to play it. Right-click it for Game Settings, Gamepad,
@@ -35,6 +38,16 @@ game, and launches it in DOSBox Staging with the settings eXoDOS recommends.
 
 **Tip:** switch your controller on *before* starting a game. DOSBox only looks
 for controllers when a game starts.
+
+## DOSBox settings
+
+All of them are in **`dosbox.conf`** in the AutoDOS folder. Open it in Notepad,
+change what you like, save, and start a game. There's no rebuild.
+
+- It's the only config DOSBox uses. DOSBox's own
+  `%LOCALAPPDATA%\DOSBox\dosbox-staging.conf` is ignored and no longer created.
+- Each game's cycles, memory, EMS/XMS and gamepad setup apply on top. Change
+  those by right-clicking the game.
 
 ## Features
 
@@ -51,8 +64,8 @@ for controllers when a game starts.
 python -m PyInstaller AutoDOS.spec
 ```
 
-You need Python 3.12 with Pillow and PyInstaller. The display settings in
-`dosbox.conf` are built into the exe, so rebuild after changing them.
+You need Python 3.12 with Pillow and PyInstaller. Ship `dosbox.conf`,
+`dosbox\` and `tools\` alongside the exe.
 
 ## Credits
 

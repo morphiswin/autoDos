@@ -11,12 +11,31 @@ support was tested with simulated controllers.
 
 ---
 
-## Display settings (the bundled `dosbox.conf`)
+## One DOSBox config: `dosbox.conf` next to `AutoDOS.exe`
 
-- **Your DOSBox display settings are no longer forced to OpenGL.** On every
-  launch the exe unpacks its own `dosbox.conf` into a fresh
-  `%LOCALAPPDATA%\Temp\_MEI…` folder and hands it to DOSBox, and that file said
-  `output = opengl`. It now uses texture output with the Direct3D renderer.
+- **DOSBox used to read three config files**, which is why there seemed to be
+  three:
+  - its own `%LOCALAPPDATA%\DOSBox\dosbox-staging.conf`, which it creates on
+    first run;
+  - any `dosbox.conf` in the folder it was started from (the AutoDOS folder);
+  - the copy built into `AutoDOS.exe`, unpacked into
+    `%LOCALAPPDATA%\Temp\_MEI…` on every launch, which overrode the other two.
+- **Now `dosbox.conf` in the AutoDOS folder is the only one.** AutoDOS starts
+  DOSBox with `--noprimaryconf --nolocalconf -conf <AutoDOS folder>\dosbox.conf`,
+  so DOSBox neither reads nor creates its own config. The exe no longer
+  carries a copy.
+- **Edits take effect** the next time a game starts. There's no rebuild.
+- **Per-game settings still apply on top** of the file: cycles, memory,
+  EMS/XMS and the gamepad mapper file.
+- **If `dosbox.conf` is missing**, games start with DOSBox's defaults and
+  AutoDOS says so once.
+
+## Display settings (in `dosbox.conf`)
+
+- **Your DOSBox display settings are no longer forced to OpenGL.** The copy of
+  `dosbox.conf` built into the exe said `output = opengl` and overrode your own
+  settings on every launch. The file now uses texture output with the
+  Direct3D renderer, and it's the only one (see above).
 - **Tuned for a 19" 4:3 LCD at 1600x1200, 60 Hz:**
   - **Fullscreen** at the desktop resolution, so the monitor never switches
     modes.
@@ -31,8 +50,7 @@ support was tested with simulated controllers.
     60 Hz panel.
   - **Faster start:** higher process priority while DOSBox is in front, and no
     DOSBox welcome banner.
-- The file is commented, so it can be adjusted for other monitors. It's built
-  into the exe, so rebuild after editing it.
+- The file is commented, so it can be adjusted for other monitors in Notepad.
 
 ## Adding games from archives (Add Zip)
 
@@ -180,6 +198,7 @@ Build the same way as before. You'll need:
 - Python 3.12 with Pillow and PyInstaller; run
   `python -m PyInstaller AutoDOS.spec`.
 - Next to `AutoDOS.exe`:
+  - `dosbox.conf`: the DOSBox settings.
   - `dosbox\`: DOSBox Staging 0.82.2, including its `SDL2.dll`, which the
     Gamepad window uses.
   - `tools\`: holds `7za.exe`.
@@ -199,3 +218,4 @@ Build the same way as before. You'll need:
 | `f0275d9` | Review fixes for archive import, disc mounting and per-game settings |
 | `768c33e` | Dark theme; remove the old XInput-only controller setup (and, briefly, Add CD) in favour of an interim SideWinder-only gamepad setup |
 | `77f1b26` | Gamepad setup for any DirectInput or XInput controller; bring back Add CD |
+| `fbaedaa` | Use one external dosbox.conf beside AutoDOS.exe |
