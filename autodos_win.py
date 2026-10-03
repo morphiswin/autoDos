@@ -21,9 +21,9 @@ import tkinter.ttk as ttk
 # ── Constants ────────────────────────────────────────────────────────────────
 import sys as _sys
 # BASE_DIR  = folder where AutoDOS.exe (or autodos_win.py) lives
-#             used for: dosbox\, tools\, games\, library.json
+#             used for: dosbox\, tools\, games\, dosbox.conf, library.json
 # ASSET_DIR = where bundled read-only assets are extracted
-#             used for: logo.png, dosbox.conf, master_games.json
+#             used for: logo.png, master_games.json
 if getattr(_sys, "frozen", False):
     BASE_DIR  = Path(_sys.executable).parent
     ASSET_DIR = Path(_sys._MEIPASS)
@@ -33,6 +33,8 @@ else:
 GAMES_DIR            = BASE_DIR / "games"
 CONTROLLER_MAPS_DIR  = BASE_DIR / "controller_maps"
 LIBRARY_FILE    = BASE_DIR / "library.json"
+# The one DOSBox config file, beside AutoDOS.exe
+DOSBOX_CONF     = BASE_DIR / "dosbox.conf"
 LOGO_FILE       = ASSET_DIR / "logo.png"
 ICON_FILE       = ASSET_DIR / "icon.ico"
 
@@ -1237,6 +1239,7 @@ class App:
         self.root    = root
         self.library: list = []
         self.dosbox  = find_dosbox()
+        self.warned_conf = False
 
         self._setup_window()
         self._build_ui()
@@ -1846,7 +1849,21 @@ class App:
             memsize = snap_memsize(int(entry.get("memsize", 16)))
         except (TypeError, ValueError):
             memsize = 16
-        base_args = (["-conf", str(ASSET_DIR / "dosbox.conf")]
+        # dosbox.conf beside AutoDOS is DOSBox's only config: it skips its own
+        # dosbox-staging.conf (and doesn't create one) and any dosbox.conf in
+        # the folder it's started from
+        conf_args = ["--noprimaryconf", "--nolocalconf"]
+        if DOSBOX_CONF.is_file():
+            conf_args += ["-conf", str(DOSBOX_CONF)]
+        elif not self.warned_conf:
+            self.warned_conf = True
+            messagebox.showwarning(
+                "dosbox.conf Not Found",
+                "dosbox.conf isn't in the AutoDOS folder, so games will use "
+                "DOSBox's default settings.\n\nPut dosbox.conf back here:\n"
+                + str(BASE_DIR),
+                parent=self.root)
+        base_args = (conf_args
                      + dosbox_cycles_args(entry.get("cycles"))
                      + ["-set", f"memsize={memsize}",
                         "-set", f"ems={str(bool(entry.get('ems', True))).lower()}",

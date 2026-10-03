@@ -5,7 +5,7 @@ a = Analysis(
     ['autodos_win.py'],
     pathex=[],
     binaries=[],
-    datas=[('logo.png', '.'), ('master_games.json', '.'), ('dosbox.conf', '.')],
+    datas=[('logo.png', '.'), ('master_games.json', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
